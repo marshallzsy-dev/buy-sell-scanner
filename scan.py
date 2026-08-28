@@ -27,11 +27,36 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 UNIVERSE_FILE = os.path.join(BASE, "universe.txt")
 STATE_FILE = os.path.join(BASE, "state.json")
 OUTPUT_HTML = os.path.join(BASE, "dashboard.html")
+VENDOR_DIR = os.path.join(BASE, "vendor")
+VENDOR_JS = os.path.join(VENDOR_DIR, "lightweight-charts.js")
+LWC_CDN = "https://unpkg.com/lightweight-charts@5.0.4/dist/lightweight-charts.standalone.production.js"
 
 RECENT_DAYS = 3          # 「近三日」窗口（交易日）
 DISAPPEAR_LOOKBACK = 15  # 只对最近 N 个交易日内的信号消失发 Warning
 WARN_KEEP_DAYS = 7       # Warning 在页面上保留的天数（按检测日历日）
 HISTORY_PERIOD = "2y"    # 拉取历史长度
+CHART_BARS = 250         # 弹层图表保留的最近 K 线根数（约 1 年）
+
+
+# ---------------------------------------------------------------------------
+# lightweight-charts 库：首次运行下载到 vendor/，之后读取内联（离线自包含）
+# ---------------------------------------------------------------------------
+def load_lwc_lib():
+    """返回 lightweight-charts standalone JS 源码字符串，供内联进 HTML。"""
+    if not os.path.exists(VENDOR_JS):
+        try:
+            import urllib.request
+            os.makedirs(VENDOR_DIR, exist_ok=True)
+            print(f"首次运行，下载 lightweight-charts 库 ...", flush=True)
+            urllib.request.urlretrieve(LWC_CDN, VENDOR_JS)
+        except Exception as e:
+            print(f"⚠ 下载图表库失败：{e}，图表将回退到 CDN 加载。", flush=True)
+            return None
+    try:
+        with open(VENDOR_JS, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -215,15 +240,53 @@ def days_ago_label(bar_date, ref_dates):
         return bar_date
 
 
-def render_html(b_list, s_list, warnings, meta):
+def build_chart_data(df, cur):
+    """把一只股票的信号结果压成弹层图表所需的数据：
+       最近 CHART_BARS 根 K 线 OHLC + 落在该窗口内的 B/S 标记。
+       返回 {'bars': [...], 'markers': [...]}。"""
+    dates = cur["dates"]
+    n = len(dates)
+    start = max(0, n - CHART_BARS)
+
+    opens = [float(x) for x in df["Open"].tolist()]
+    highs = [float(x) for x in df["High"].tolist()]
+    lows = [float(x) for x in df["Low"].tolist()]
+    closes = cur["closes"]
+
+    bars = []
+    for i in range(start, n):
+        bars.append({
+            "time": dates[i],
+            "open": round(opens[i], 2),
+            "high": round(highs[i], 2),
+            "low": round(lows[i], 2),
+            "close": round(closes[i], 2),
+        })
+
+    window = set(dates[start:])
+    markers = []
+    for d in cur["b_dates"]:
+        if d in window:
+            markers.append({"time": d, "side": "B"})
+    for d in cur["s_dates"]:
+        if d in window:
+            markers.append({"time": d, "side": "S"})
+    markers.sort(key=lambda m: m["time"])
+    return {"bars": bars, "markers": markers}
+
+
+def render_html(b_list, s_list, warnings, meta, chart_data):
     et = meta["run_et"]
     stamp = et.strftime("%Y-%m-%d %H:%M")
 
     def row_bs(item):
         code = item["ticker"]
+        has = code in chart_data
+        cell = (f'<a class="chart-link" data-sym="{code}">{code}</a>' if has
+                else f'<a href="{tv_url(code)}" target="_blank" rel="noopener">{code}</a>')
         return (
             f'<tr>'
-            f'<td class="code"><a href="{tv_url(code)}" target="_blank" rel="noopener">{code}</a></td>'
+            f'<td class="code">{cell}</td>'
             f'<td>{item["last_date"]}</td>'
             f'<td><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
             f'<td class="num">{item["price"]:.2f}</td>'
@@ -234,9 +297,12 @@ def render_html(b_list, s_list, warnings, meta):
         code = w["ticker"]
         badge = "B" if w["side"] == "B" else "S"
         bcls = "b" if w["side"] == "B" else "s"
+        has = code in chart_data
+        cell = (f'<a class="chart-link" data-sym="{code}">{code}</a>' if has
+                else f'<a href="{tv_url(code)}" target="_blank" rel="noopener">{code}</a>')
         return (
             f'<tr>'
-            f'<td class="code"><a href="{tv_url(code)}" target="_blank" rel="noopener">{code}</a></td>'
+            f'<td class="code">{cell}</td>'
             f'<td><span class="tag {bcls}">{badge} 消失</span></td>'
             f'<td class="node">{w["bar_date"]}</td>'
             f'<td>{w["detected_on"]}</td>'
@@ -250,6 +316,16 @@ def render_html(b_list, s_list, warnings, meta):
 
     skipped = meta["skipped"]
     skipped_txt = "、".join(skipped) if skipped else "无"
+
+    # 图表数据内联（紧凑 JSON）
+    chart_json = json.dumps(chart_data, ensure_ascii=False, separators=(",", ":"))
+
+    # lightweight-charts 库：内联优先，失败回退 CDN
+    lib = meta.get("lwc_lib")
+    if lib:
+        lib_script = f"<script>{lib}</script>"
+    else:
+        lib_script = f'<script src="{LWC_CDN}"></script>'
 
     return f"""<!DOCTYPE html>
 <html lang="zh">
@@ -291,6 +367,24 @@ def render_html(b_list, s_list, warnings, meta):
   .warn-sec {{ border-color:rgba(240,160,32,.4); }}
   .empty {{ color:var(--muted); text-align:center; padding:16px; }}
   footer {{ color:var(--muted); font-size:11px; margin-top:22px; line-height:1.6; }}
+  td.code a.chart-link {{ cursor:pointer; }}
+  /* 图表弹层 */
+  .modal {{ position:fixed; inset:0; background:rgba(0,0,0,.72); display:none;
+    align-items:center; justify-content:center; z-index:50; padding:16px; }}
+  .modal.open {{ display:flex; }}
+  .modal-box {{ background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    width:min(920px,96vw); max-height:92vh; overflow:hidden; display:flex; flex-direction:column; }}
+  .modal-head {{ display:flex; align-items:center; justify-content:space-between;
+    padding:12px 14px; border-bottom:1px solid var(--line); }}
+  .modal-title {{ font-size:16px; font-weight:600; letter-spacing:.5px; }}
+  .modal-title .lg {{ margin-left:8px; font-size:11px; font-weight:400; }}
+  .modal-title .lg .b {{ color:#5fd98a; }} .modal-title .lg .s {{ color:#f07fce; }}
+  .modal-actions {{ display:flex; align-items:center; gap:12px; }}
+  .modal-actions a {{ color:#58a6ff; font-size:12px; text-decoration:none; }}
+  .modal-close {{ cursor:pointer; color:var(--muted); font-size:22px; line-height:1;
+    background:none; border:none; }}
+  .modal-close:hover {{ color:var(--text); }}
+  #chart {{ width:100%; height:460px; }}
 </style>
 </head>
 <body>
@@ -325,11 +419,82 @@ def render_html(b_list, s_list, warnings, meta):
   </section>
 
   <footer>
-    · 点击代码跳转 TradingView 该股走势图。<br>
+    · 点击代码弹出该股 K 线图，B/S 买卖点已标在图上（可缩放、拖动）；无图表数据的代码则跳 TradingView。<br>
     · 本工具复刻 “S1 Formula v34” 指标，<b>该算法会重绘</b>：历史 K 线上的买卖点会随新数据变动/消失，Warning 区即用于追踪这一现象。<br>
     · 抓取失败/跳过的代码：{skipped_txt}
   </footer>
 </div>
+
+<div class="modal" id="modal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <div class="modal-title"><span id="m-sym"></span><span class="lg">
+        <span class="b">▲ B 买点</span> · <span class="s">▼ S 卖点</span></span></div>
+      <div class="modal-actions">
+        <a id="m-tv" href="#" target="_blank" rel="noopener">在 TradingView 打开 ↗</a>
+        <button class="modal-close" id="m-close" aria-label="关闭">×</button>
+      </div>
+    </div>
+    <div id="chart"></div>
+  </div>
+</div>
+
+{lib_script}
+<script>
+const CHART_DATA = {chart_json};
+const $ = (id) => document.getElementById(id);
+let _chart = null, _ro = null;
+
+function openChart(sym) {{
+  const d = CHART_DATA[sym];
+  if (!d || !window.LightweightCharts) return;
+  $('m-sym').textContent = sym;
+  $('m-tv').href = 'https://www.tradingview.com/chart/?symbol=' + encodeURIComponent(sym);
+  $('modal').classList.add('open');
+
+  const box = $('chart');
+  box.innerHTML = '';
+  const LWC = window.LightweightCharts;
+  _chart = LWC.createChart(box, {{
+    layout: {{ background: {{ color: '#161b22' }}, textColor: '#8b98a9' }},
+    grid: {{ vertLines: {{ color: '#232a34' }}, horzLines: {{ color: '#232a34' }} }},
+    rightPriceScale: {{ borderColor: '#232a34' }},
+    timeScale: {{ borderColor: '#232a34', timeVisible: false }},
+    crosshair: {{ mode: 0 }},
+    autoSize: false,
+    width: box.clientWidth, height: box.clientHeight,
+  }});
+  const series = _chart.addSeries(LWC.CandlestickSeries, {{
+    upColor: '#2fb35a', downColor: '#d63c9c', borderVisible: false,
+    wickUpColor: '#2fb35a', wickDownColor: '#d63c9c',
+  }});
+  series.setData(d.bars);
+
+  const markers = d.markers.map(m => m.side === 'B'
+    ? {{ time: m.time, position: 'belowBar', color: '#2fb35a', shape: 'arrowUp', text: 'B' }}
+    : {{ time: m.time, position: 'aboveBar', color: '#d63c9c', shape: 'arrowDown', text: 'S' }});
+  LWC.createSeriesMarkers(series, markers);
+  _chart.timeScale().fitContent();
+
+  _ro = new ResizeObserver(() => {{
+    if (_chart) _chart.applyOptions({{ width: box.clientWidth, height: box.clientHeight }});
+  }});
+  _ro.observe(box);
+}}
+
+function closeChart() {{
+  $('modal').classList.remove('open');
+  if (_ro) {{ _ro.disconnect(); _ro = null; }}
+  if (_chart) {{ _chart.remove(); _chart = null; }}
+}}
+
+document.querySelectorAll('a.chart-link').forEach(a => {{
+  a.addEventListener('click', () => openChart(a.dataset.sym));
+}});
+$('m-close').addEventListener('click', closeChart);
+$('modal').addEventListener('click', (e) => {{ if (e.target === $('modal')) closeChart(); }});
+document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeChart(); }});
+</script>
 </body>
 </html>"""
 
@@ -367,6 +532,7 @@ def main():
     s_list = []
     new_warnings = []
     data_last = ""
+    chart_data = {}   # {ticker: {'bars':[...], 'markers':[...]}}，仅上榜股票
 
     for t, df in data.items():
         try:
@@ -401,6 +567,9 @@ def main():
                 "recency_cls": "today" if last_d == dates[-1] else "recent",
                 "sort": dates.index(last_d),
             })
+        # 上榜股票（B 或 S）额外保存画图数据
+        if recent_b or recent_s:
+            chart_data[t] = build_chart_data(df, cur)
 
         # 消失检测
         new_warnings.extend(detect_disappearances(t, prev_tickers.get(t), cur, today_str))
@@ -427,8 +596,9 @@ def main():
         "universe_n": len(tickers),
         "ok_n": len(data),
         "skipped": skipped,
+        "lwc_lib": load_lwc_lib(),
     }
-    html = render_html(b_list, s_list, warnings, meta)
+    html = render_html(b_list, s_list, warnings, meta, chart_data)
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
 
