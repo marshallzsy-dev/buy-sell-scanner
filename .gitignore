@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+run.log
+# dashboard.html 由 CI 每次重新生成，不入库；state.json 需要入库（消失检测靠它累积历史）
+dashboard.html
+_site/
