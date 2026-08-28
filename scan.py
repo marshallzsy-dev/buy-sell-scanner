@@ -98,6 +98,15 @@ def load_universe():
 def _extract(data, t, single):
     try:
         sub = data if single else data[t]
+        # yfinance 有时返回 MultiIndex 列（尤其单只回退时），展平成单级，
+        # 否则 sub["Open"] 会是 DataFrame 而非 Series，下游 .tolist() 报错。
+        if hasattr(sub.columns, "nlevels") and sub.columns.nlevels > 1:
+            lvl0 = set(sub.columns.get_level_values(0))
+            # 取含 OHLCV 的那一级作为列名
+            if {"Open", "High", "Low", "Close"} <= lvl0:
+                sub.columns = sub.columns.get_level_values(0)
+            else:
+                sub.columns = sub.columns.get_level_values(-1)
         sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
         if len(sub) >= 60:
             return sub
@@ -532,7 +541,8 @@ def main():
     s_list = []
     new_warnings = []
     data_last = ""
-    chart_data = {}   # {ticker: {'bars':[...], 'markers':[...]}}，仅上榜股票
+    chart_data = {}   # {ticker: {'bars':[...], 'markers':[...]}}
+    computed = {}     # {ticker: cur}，缓存本次算好的信号，供 warning 补图
 
     for t, df in data.items():
         try:
@@ -544,6 +554,7 @@ def main():
         dates = cur["dates"]
         if not dates:
             continue
+        computed[t] = cur
         data_last = max(data_last, dates[-1])
         recent = set(dates[-RECENT_DAYS:])
         price = cur["closes"][-1]
@@ -572,7 +583,11 @@ def main():
             chart_data[t] = build_chart_data(df, cur)
 
         # 消失检测
-        new_warnings.extend(detect_disappearances(t, prev_tickers.get(t), cur, today_str))
+        tw = detect_disappearances(t, prev_tickers.get(t), cur, today_str)
+        new_warnings.extend(tw)
+        # 本次产生消失告警的股票也存图（方便直接看消失节点原本所在的 K 线）
+        if tw and t not in chart_data:
+            chart_data[t] = build_chart_data(df, cur)
 
         # 保存本次快照
         new_tickers_state[t] = {
@@ -589,6 +604,12 @@ def main():
     warnings = merge_warnings(state.get("warnings", []), new_warnings, today)
     # 展示排序：检测日新的在前，其次消失节点新的在前
     warnings.sort(key=lambda w: (w["detected_on"], w["bar_date"], w["ticker"]), reverse=True)
+
+    # 为 warning 区里仍缺图的股票补图（含往日保留的旧告警，只要本次抓到了数据）
+    for w in warnings:
+        t = w["ticker"]
+        if t not in chart_data and t in computed and t in data:
+            chart_data[t] = build_chart_data(data[t], computed[t])
 
     meta = {
         "run_et": et,
