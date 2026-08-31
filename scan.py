@@ -403,14 +403,6 @@ def render_html(b_list, s_list, warnings, meta, chart_data):
     <div class="sub">数据截至 {meta['data_last']} · 生成于 {stamp} 美东 · 股票池 {meta['universe_n']} 只（成功 {meta['ok_n']}）</div>
   </header>
 
-  <section class="warn-sec">
-    <div class="stitle"><span class="dot a"></span> ⚠ Warning · 近期消失的买卖点 <span class="cnt">（{len(warnings)}）</span></div>
-    <table>
-      <thead><tr><th>代码</th><th>类型</th><th>消失节点(K线日期)</th><th>检测于</th></tr></thead>
-      <tbody>{warn_rows}</tbody>
-    </table>
-  </section>
-
   <section>
     <div class="stitle"><span class="dot g"></span> B 买点 · 当日/近三日 <span class="cnt">（{len(b_list)}）</span></div>
     <table>
@@ -424,6 +416,14 @@ def render_html(b_list, s_list, warnings, meta, chart_data):
     <table>
       <thead><tr><th>代码</th><th>最近S日期</th><th>时点</th><th>现价</th></tr></thead>
       <tbody>{s_rows}</tbody>
+    </table>
+  </section>
+
+  <section class="warn-sec">
+    <div class="stitle"><span class="dot a"></span> ⚠ Warning · 近期消失的买卖点 <span class="cnt">（{len(warnings)}）</span></div>
+    <table>
+      <thead><tr><th>代码</th><th>类型</th><th>消失节点(K线日期)</th><th>检测于</th></tr></thead>
+      <tbody>{warn_rows}</tbody>
     </table>
   </section>
 
