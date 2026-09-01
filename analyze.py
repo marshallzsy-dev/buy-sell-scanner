@@ -284,9 +284,13 @@ def strategy_lab(configs, min_bars=60):
                 sma_val[i] = s / win
         isB = [False] * n
         isS = [False] * n
+        # 滚动窗口重算 realtime 信号：窗口=约2年(504交易日)，与线上扫描器 period=2y 一致，
+        # 既更贴近实盘视角，又把每根重算成本降为常数、支持长历史回测。
+        WIN = 504
         for i in range(min_bars - 1, n):
+            lo = max(0, i + 1 - WIN)
             try:
-                cur = scan.compute_signals(df.iloc[:i + 1])
+                cur = scan.compute_signals(df.iloc[lo:i + 1])
             except Exception:
                 continue
             if not cur["dates"]:
@@ -330,9 +334,13 @@ def bs_strategy(configs, min_bars=60):
         closes = [float(x) for x in df["Close"].tolist()]
         isB = [False] * n
         isS = [False] * n
+        # 滚动窗口重算 realtime 信号：窗口=约2年(504交易日)，与线上扫描器 period=2y 一致，
+        # 既更贴近实盘视角，又把每根重算成本降为常数、支持长历史回测。
+        WIN = 504
         for i in range(min_bars - 1, n):
+            lo = max(0, i + 1 - WIN)
             try:
-                cur = scan.compute_signals(df.iloc[:i + 1])
+                cur = scan.compute_signals(df.iloc[lo:i + 1])
             except Exception:
                 continue
             if not cur["dates"]:
@@ -374,6 +382,11 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+    yrs = _argval("--years")
+    if yrs:
+        scan.HISTORY_PERIOD = f"{int(yrs)}y"      # 覆盖抓取历史长度（默认 scan.py 里的 2y）
+        print(f"抓取历史长度覆盖为 {scan.HISTORY_PERIOD}")
 
     if "--forward" in sys.argv:
         args = sys.argv[sys.argv.index("--forward") + 1:]

@@ -18,6 +18,10 @@ on:
         description: '策略止盈百分比（默认 20）'
         required: false
         default: '20'
+      years:
+        description: '策略实验室抓取历史年数（默认 2，可填 5 做多周期检验）'
+        required: false
+        default: '2'
 
 jobs:
   forward:
@@ -56,7 +60,7 @@ jobs:
 
       - name: Run strategy lab (multiple variants)
         run: |
-          python analyze.py --lab | tee lab_result.txt
+          python analyze.py --lab --years "${{ inputs.years }}" | tee lab_result.txt
           {
             echo "### 策略实验室 · 多变体对照（移动止损/趋势过滤 vs 买入持有）"
             echo '```'
