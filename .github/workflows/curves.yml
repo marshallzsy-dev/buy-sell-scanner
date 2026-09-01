@@ -1,0 +1,23 @@
+name: Equity curves
+
+# 手动触发：云端算各策略的组合净值曲线 + 最大回撤，结果(JSON)打到日志，
+# 本地据此生成资金曲线对比图。不写回仓库、不部署。
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: '抓取历史年数（默认 5）'
+        required: false
+        default: '5'
+
+jobs:
+  curves:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Compute equity curves
+        run: python analyze.py --curves --years "${{ inputs.years }}"

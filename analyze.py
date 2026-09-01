@@ -280,6 +280,148 @@ def _sim_lab(isB, isS, opens, closes, sma_val, n, min_bars, params):
     return rets, holds, reasons, (eq - 1) * 100, (1 if pos else 0)
 
 
+def _equity_series(isB, isS, opens, closes, sma_val, n, min_bars, params):
+    """单只股票的每日净值序列（起点1.0）：做多、单仓，出场=S或移动止损(收盘)，按收盘 mark-to-market。"""
+    trail = params.get("trail")
+    sma = params.get("sma")
+    use_s = params.get("use_s", True)
+    partial_s = params.get("partial_s", 0.0)
+    eq = [1.0] * n
+    realized = 1.0
+    pos = False
+    entry = 0.0
+    entry_i = -1
+    peak = 0.0
+    s_taken = False
+    s_price = 0.0
+    for i in range(min_bars - 1, n):
+        if pos and i >= entry_i:
+            c = closes[i]
+            if c > peak:
+                peak = c
+            trailing = trail is not None and peak > 0 and c <= peak * (1 - trail / 100)
+            if partial_s > 0:
+                if use_s and isS[i] and not s_taken:
+                    s_taken = True
+                    s_price = c
+                if trailing:
+                    mult = (partial_s * (s_price / entry) + (1 - partial_s) * (c / entry)) if s_taken else (c / entry)
+                    realized *= mult
+                    pos = False
+            else:
+                if trailing or (use_s and isS[i]):
+                    realized *= c / entry
+                    pos = False
+        if not pos and isB[i] and i + 1 < n and opens[i + 1]:
+            ok_entry = True
+            if sma is not None:
+                sv = sma_val[i]
+                ok_entry = sv is not None and closes[i] > sv
+            if ok_entry:
+                pos = True
+                entry = opens[i + 1]
+                entry_i = i + 1
+                peak = 0.0
+                s_taken = False
+                s_price = 0.0
+        if pos and i >= entry_i:
+            c = closes[i]
+            factor = (partial_s * (s_price / entry) + (1 - partial_s) * (c / entry)) if (partial_s > 0 and s_taken) else (c / entry)
+            eq[i] = realized * factor
+        else:
+            eq[i] = realized
+    return eq
+
+
+def _max_drawdown(series):
+    """返回最大回撤(%)，正数表示回撤幅度。"""
+    peak = series[0] if series else 1.0
+    mdd = 0.0
+    for v in series:
+        if v > peak:
+            peak = v
+        if peak > 0:
+            dd = (peak - v) / peak * 100
+            if dd > mdd:
+                mdd = dd
+    return mdd
+
+
+def strategy_curves(configs, min_bars=60):
+    """按日期跨全部股票平均，得到各策略的组合净值曲线 + 买入持有对照。
+    返回 {'dates':[...], 'series':{label:[净值...]}, 'mdd':{label:%}, 'final':{label:%}}。"""
+    from collections import defaultdict
+    tickers = scan.load_universe()
+    data = scan.fetch_all(tickers)
+    labels = [lab for lab, _ in configs] + ["买入持有"]
+    agg = {lab: defaultdict(lambda: [0.0, 0]) for lab in labels}   # date -> [sum, count]
+    for t, df in data.items():
+        n = len(df)
+        if n < min_bars + 2:
+            continue
+        opens = [float(x) for x in df["Open"].tolist()]
+        closes = [float(x) for x in df["Close"].tolist()]
+        dates = [d.strftime("%Y-%m-%d") for d in df.index]
+        sma_val = [None] * n
+        w = 200
+        if n >= w:
+            s = sum(closes[:w])
+            sma_val[w - 1] = s / w
+            for i in range(w, n):
+                s += closes[i] - closes[i - w]
+                sma_val[i] = s / w
+        isB = [False] * n
+        isS = [False] * n
+        WIN = 504
+        for i in range(min_bars - 1, n):
+            lo = max(0, i + 1 - WIN)
+            try:
+                cur = scan.compute_signals(df.iloc[lo:i + 1])
+            except Exception:
+                continue
+            if not cur["dates"]:
+                continue
+            last = cur["dates"][-1]
+            if last in set(cur["b_dates"]):
+                isB[i] = True
+            if last in set(cur["s_dates"]):
+                isS[i] = True
+        base_c = closes[min_bars - 1]
+        for lab, params in configs:
+            eqs = _equity_series(isB, isS, opens, closes, sma_val, n, min_bars, params)
+            for i in range(min_bars - 1, n):
+                slot = agg[lab][dates[i]]
+                slot[0] += eqs[i]
+                slot[1] += 1
+        for i in range(min_bars - 1, n):
+            slot = agg["买入持有"][dates[i]]
+            slot[0] += closes[i] / base_c if base_c else 1.0
+            slot[1] += 1
+    all_dates = sorted(set().union(*[set(agg[lab].keys()) for lab in labels]))
+    series = {}
+    mdd = {}
+    final = {}
+    for lab in labels:
+        vals = []
+        for d in all_dates:
+            s, c = agg[lab].get(d, [0.0, 0])
+            vals.append(round(s / c, 4) if c else None)
+        # 用前值填补缺口，保证曲线连续
+        last = 1.0
+        filled = []
+        for v in vals:
+            if v is None:
+                filled.append(last)
+            else:
+                filled.append(v)
+                last = v
+        series[lab] = filled
+        mdd[lab] = round(_max_drawdown(filled), 1)
+        final[lab] = round((filled[-1] - 1) * 100, 1)
+    return {"dates": all_dates, "series": series, "mdd": mdd, "final": final,
+            "ok": len(data), "tot": len(tickers)}
+
+
 def strategy_lab(configs, min_bars=60):
     """一次抓数+walk-forward 判定 realtime B/S，对多套策略配置分别模拟。
       configs: [(label, params_dict), ...]"""
@@ -428,6 +570,22 @@ def main():
         _stats("  任意日做多", r["base"])
         print("\n注：realtime 组才是接近真实的收益（信号在该K线为最新时当场就出）；")
         print("    repainted 组把事后重绘冒出来的点也算进去，会显著高估。均未扣手续费/滑点。")
+        return
+
+    if "--curves" in sys.argv:
+        configs = [
+            ("B→S 基线", {}),
+            ("趋势跟随10%移动止损", {"trail": 10, "use_s": False}),
+            ("趋势跟随15%移动止损", {"trail": 15, "use_s": False}),
+            ("分批S半仓+半仓10%移动", {"trail": 10, "partial_s": 0.5}),
+        ]
+        res = strategy_curves(configs)
+        print(f"数据覆盖：{res['ok']}/{res['tot']} 只")
+        print("最大回撤：" + " | ".join(f"{k} {v}%" for k, v in res["mdd"].items()))
+        print("最终收益：" + " | ".join(f"{k} {v}%" for k, v in res["final"].items()))
+        print("CURVES_JSON_BEGIN")
+        print(json.dumps(res, ensure_ascii=False, separators=(",", ":")))
+        print("CURVES_JSON_END")
         return
 
     if "--lab" in sys.argv:
