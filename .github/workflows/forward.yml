@@ -35,3 +35,13 @@ jobs:
             cat fwd_result.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run repaint-in analysis
+        run: |
+          python analyze.py --repaint-in | tee ri_result.txt
+          {
+            echo "### S1 补标(repaint-in)分析 · 信号是当天出还是过几天补标"
+            echo '```'
+            cat ri_result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

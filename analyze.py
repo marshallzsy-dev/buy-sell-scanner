@@ -118,6 +118,49 @@ def forward_all(hold=5, rt_min_bars=60):
                 ok=len(data), tot=len(tickers))
 
 
+def repaint_in_analysis(rt_min_bars=60):
+    """量化「补标」(repaint-in)：一根K线当天(它作为最新K线时)没出信号，
+    但过 N 天后被重绘补标上 B/S。方法：walk-forward 逐根重算，记录每个信号
+    首次出现时的最新K线 index i，与该信号自身K线 index j 之差 = 补标延迟。
+      lag=0：当天就出（实时）；  lag>=1：补标（延迟 lag 个交易日画上去）。
+    返回 {side: {'same':n, 'lags':[...]}}，只统计 own_index>=rt_min_bars 的可评估信号。"""
+    tickers = scan.load_universe()
+    data = scan.fetch_all(tickers)
+    res = {"B": {"same": 0, "lags": []}, "S": {"same": 0, "lags": []}}
+    for t, df in data.items():
+        n = len(df)
+        if n < rt_min_bars + 2:
+            continue
+        try:
+            full = scan.compute_signals(df)
+        except Exception:
+            continue
+        if not full["dates"] or len(full["dates"]) != n:
+            continue
+        gidx = {d: k for k, d in enumerate(full["dates"])}   # 日期 -> 全局 index
+        first_seen = {"B": {}, "S": {}}
+        for i in range(rt_min_bars - 1, n):
+            try:
+                cur = scan.compute_signals(df.iloc[:i + 1])
+            except Exception:
+                continue
+            for side, key in (("B", "b_dates"), ("S", "s_dates")):
+                for d in cur[key]:
+                    if d not in first_seen[side]:
+                        first_seen[side][d] = i          # 首次被画上去时的最新K线 index
+        for side in ("B", "S"):
+            for d, seen_i in first_seen[side].items():
+                j = gidx.get(d)
+                if j is None or j < rt_min_bars - 1:
+                    continue                             # 早期bar无法评估当天
+                lag = seen_i - j
+                if lag <= 0:
+                    res[side]["same"] += 1
+                else:
+                    res[side]["lags"].append(lag)
+    return res, len(data), len(tickers)
+
+
 def _stats(name, arr):
     import statistics as st
     if not arr:
@@ -156,6 +199,35 @@ def main():
         _stats("  任意日做多", r["base"])
         print("\n注：realtime 组才是接近真实的收益（信号在该K线为最新时当场就出）；")
         print("    repainted 组把事后重绘冒出来的点也算进去，会显著高估。均未扣手续费/滑点。")
+        return
+
+    if "--repaint-in" in sys.argv:
+        res, ok, tot = repaint_in_analysis()
+        print(f"\n== 补标(repaint-in)分析：信号是当天就出，还是过几天才被画上去 ==")
+        print(f"数据覆盖：{ok}/{tot} 只\n")
+        for side, label in (("B", "B 买点"), ("S", "S 卖点")):
+            same = res[side]["same"]
+            lags = res[side]["lags"]
+            total = same + len(lags)
+            if not total:
+                print(f"{label}: 无样本"); continue
+            ratein = len(lags) / total * 100
+            import statistics as st
+            med = st.median(lags) if lags else 0
+            mx = max(lags) if lags else 0
+            # 分桶
+            b = {"1天": 0, "2-3天": 0, "4-5天": 0, ">5天": 0}
+            for L in lags:
+                if L == 1: b["1天"] += 1
+                elif L <= 3: b["2-3天"] += 1
+                elif L <= 5: b["4-5天"] += 1
+                else: b[">5天"] += 1
+            print(f"{label}：共 {total} 个 | 当天就出 {same}（{same/total*100:.1f}%） | "
+                  f"补标 {len(lags)}（{ratein:.1f}%）")
+            print(f"    补标延迟：中位 {med} 天 / 最长 {mx} 天 | "
+                  f"1天={b['1天']} 2-3天={b['2-3天']} 4-5天={b['4-5天']} >5天={b['>5天']}")
+        print("\n注：lag=首次被画上信号时的最新K线，距该信号自身K线的交易日数；")
+        print("    lag=0 当天就出（实时可见）；lag>=1 即当天没出、后来重绘补标。")
         return
 
     buckets, dates = compute_from_history()
