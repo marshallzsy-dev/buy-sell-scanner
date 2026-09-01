@@ -60,3 +60,30 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deploy
         uses: actions/deploy-pages@v5
+
+      # ---- 每日邮件速递 ----
+      # 需在仓库 Settings → Secrets and variables → Actions 配置三个 secret：
+      #   MAIL_USERNAME  发信 Gmail 地址（如 you@gmail.com）
+      #   MAIL_PASSWORD  该 Gmail 的「应用专用密码」(App Password，16位，非登录密码)
+      #   MAIL_TO        收件人地址，多个用英文逗号分隔
+      # 只在 scan 成功（前面步骤都 OK）时发；限流中止(exit 2)会让 Run scan 失败从而跳过发信。
+      - name: Read email subject
+        id: subj
+        run: echo "subject=$(cat email_subject.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Send email digest
+        if: ${{ env.MAIL_TO != '' }}
+        env:
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          from: S1 Scanner <${{ secrets.MAIL_USERNAME }}>
+          to: ${{ secrets.MAIL_TO }}
+          subject: ${{ steps.subj.outputs.subject }}
+          html_body: file://email_body.html
+          attachments: dashboard.html

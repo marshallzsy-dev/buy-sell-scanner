@@ -27,9 +27,12 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 UNIVERSE_FILE = os.path.join(BASE, "universe.txt")
 STATE_FILE = os.path.join(BASE, "state.json")
 OUTPUT_HTML = os.path.join(BASE, "dashboard.html")
+EMAIL_HTML = os.path.join(BASE, "email_body.html")     # CI 发信用的精简正文
+EMAIL_SUBJECT = os.path.join(BASE, "email_subject.txt")  # CI 读取作为邮件主题
 VENDOR_DIR = os.path.join(BASE, "vendor")
 VENDOR_JS = os.path.join(VENDOR_DIR, "lightweight-charts.js")
 LWC_CDN = "https://unpkg.com/lightweight-charts@5.0.4/dist/lightweight-charts.standalone.production.js"
+LIVE_URL = "https://marshallzsy-dev.github.io/buy-sell-scanner/"  # 线上 dashboard 地址
 
 RECENT_DAYS = 3          # 「近三日」窗口（交易日）
 DISAPPEAR_LOOKBACK = 15  # 只对最近 N 个交易日内的信号消失发 Warning
@@ -509,6 +512,112 @@ document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeChar
 
 
 # ---------------------------------------------------------------------------
+# 邮件正文（精简版，邮箱客户端友好：内联样式 + 纯表格 + 浅色主题）
+# ---------------------------------------------------------------------------
+def render_email(b_list, s_list, warnings, meta):
+    """生成每日邮件 HTML 正文。与 dashboard 不同：无脚本/无图表，
+    用内联样式和简单表格，兼容 Gmail/Outlook 等客户端。"""
+    stamp = meta["run_et"].strftime("%Y-%m-%d %H:%M")
+
+    def bs_rows(items, empty_txt):
+        if not items:
+            return (f'<tr><td colspan="4" style="padding:10px 8px;color:#8a94a6;'
+                    f'text-align:center;">{empty_txt}</td></tr>')
+        out = []
+        for it in items:
+            hot = it["recency_cls"] == "today"
+            pill_bg = "#e6f7ec" if hot else "#eef1f5"
+            pill_fg = "#1a8f45" if hot else "#6b7280"
+            out.append(
+                f'<tr>'
+                f'<td style="padding:8px;border-top:1px solid #edf0f4;font-weight:600;">{it["ticker"]}</td>'
+                f'<td style="padding:8px;border-top:1px solid #edf0f4;color:#4b5563;font-variant-numeric:tabular-nums;">{it["last_date"]}</td>'
+                f'<td style="padding:8px;border-top:1px solid #edf0f4;">'
+                f'<span style="font-size:12px;padding:2px 8px;border-radius:10px;background:{pill_bg};color:{pill_fg};">{it["recency"]}</span></td>'
+                f'<td style="padding:8px;border-top:1px solid #edf0f4;text-align:right;font-variant-numeric:tabular-nums;">{it["price"]:.2f}</td>'
+                f'</tr>'
+            )
+        return "\n".join(out)
+
+    def warn_rows_html(ws):
+        if not ws:
+            return ('<tr><td colspan="4" style="padding:10px 8px;color:#8a94a6;'
+                    'text-align:center;">暂无消失记录</td></tr>')
+        out = []
+        for w in ws:
+            is_b = w["side"] == "B"
+            tag_bg = "#e6f7ec" if is_b else "#fbe8f4"
+            tag_fg = "#1a8f45" if is_b else "#b8348a"
+            out.append(
+                f'<tr>'
+                f'<td style="padding:8px;border-top:1px solid #edf0f4;font-weight:600;">{w["ticker"]}</td>'
+                f'<td style="padding:8px;border-top:1px solid #edf0f4;">'
+                f'<span style="font-size:12px;padding:2px 8px;border-radius:6px;background:{tag_bg};color:{tag_fg};font-weight:600;">{w["side"]} 消失</span></td>'
+                f'<td style="padding:8px;border-top:1px solid #edf0f4;color:#d97706;font-variant-numeric:tabular-nums;">{w["bar_date"]}</td>'
+                f'<td style="padding:8px;border-top:1px solid #edf0f4;color:#4b5563;">{w["detected_on"]}</td>'
+                f'</tr>'
+            )
+        return "\n".join(out)
+
+    def section(title, dot, count, headers, rows_html):
+        ths = "".join(
+            f'<th style="text-align:{"right" if i==len(headers)-1 else "left"};'
+            f'padding:6px 8px;color:#8a94a6;font-size:11px;font-weight:600;'
+            f'text-transform:uppercase;letter-spacing:.4px;">{h}</th>'
+            for i, h in enumerate(headers)
+        )
+        return f"""
+      <tr><td style="padding:22px 24px 0;">
+        <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:8px;">
+          <span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:{dot};margin-right:7px;"></span>
+          {title} <span style="color:#9aa3b2;font-weight:400;font-size:13px;">（{count}）</span>
+        </div>
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;color:#1f2937;">
+          <tr>{ths}</tr>
+          {rows_html}
+        </table>
+      </td></tr>"""
+
+    b_sec = section("B 买点 · 当日/近三日", "#2fb35a", len(b_list),
+                    ["代码", "最近B日期", "时点", "现价"],
+                    bs_rows(b_list, "近三日无 B 买点"))
+    s_sec = section("S 卖点 · 当日/近三日", "#d63c9c", len(s_list),
+                    ["代码", "最近S日期", "时点", "现价"],
+                    bs_rows(s_list, "近三日无 S 卖点"))
+    w_sec = section("⚠ 近期消失的买卖点", "#f0a020", len(warnings),
+                    ["代码", "类型", "消失节点", "检测于"],
+                    warn_rows_html(warnings))
+
+    return f"""<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f6f9;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f9;padding:20px 0;">
+    <tr><td align="center">
+      <table role="presentation" width="640" cellpadding="0" cellspacing="0" style="max-width:640px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e6e9ef;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;">
+        <tr><td style="padding:22px 24px 6px;">
+          <div style="font-size:19px;font-weight:800;color:#0f172a;letter-spacing:.3px;">S1 买卖点扫描 · 每日速递</div>
+          <div style="font-size:12px;color:#8a94a6;margin-top:4px;">数据截至 {meta['data_last']} · 生成于 {stamp} 美东 · 股票池 {meta['universe_n']} 只（成功 {meta['ok_n']}）</div>
+        </td></tr>
+        <tr><td style="padding:14px 24px 0;">
+          <a href="{LIVE_URL}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;font-size:13px;font-weight:600;padding:9px 16px;border-radius:8px;">打开完整看板（可点开 K 线图）↗</a>
+        </td></tr>
+        {b_sec}
+        {s_sec}
+        {w_sec}
+        <tr><td style="padding:20px 24px 24px;">
+          <div style="border-top:1px solid #edf0f4;padding-top:12px;font-size:11px;color:#9aa3b2;line-height:1.6;">
+            · 附件 dashboard.html 为离线完整版，双击打开可点代码弹出 K 线图（B/S 已标注）。<br>
+            · 本工具复刻 “S1 Formula v34” 指标，<b>该算法会重绘</b>：历史买卖点会随新数据变动/消失，消失区即用于追踪。<br>
+            · 抓取跳过的代码：{("、".join(meta["skipped"]) if meta["skipped"] else "无")}
+          </div>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>"""
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 def main():
@@ -628,6 +737,13 @@ def main():
     state["tickers"] = new_tickers_state
     state["warnings"] = warnings
     save_state(state)
+
+    # 邮件正文 + 主题（供 CI 发信；本地跑也会生成，无害）
+    with open(EMAIL_HTML, "w", encoding="utf-8") as f:
+        f.write(render_email(b_list, s_list, warnings, meta))
+    subject = f"S1 扫描 {today_str} · B{len(b_list)} / S{len(s_list)} / 消失{len(warnings)}"
+    with open(EMAIL_SUBJECT, "w", encoding="utf-8") as f:
+        f.write(subject)
 
     print(f"完成：B {len(b_list)} 只 / S {len(s_list)} 只 / 消失告警 {len(warnings)} 条", flush=True)
     print(f"已生成 {OUTPUT_HTML}", flush=True)
