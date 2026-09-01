@@ -5,4 +5,7 @@ run.log
 dashboard.html
 email_body.html
 email_subject.txt
+equity_curves.html
+curves_preview.png
+curves.json
 _site/
