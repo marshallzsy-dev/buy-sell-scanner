@@ -161,6 +161,65 @@ def repaint_in_analysis(rt_min_bars=60):
     return res, len(data), len(tickers)
 
 
+def bs_strategy(min_bars=60):
+    """事件驱动策略回测（全用 realtime 信号，剥掉重绘）：
+      B 信号当天出现 → 次日开盘买入；持有到 S 信号出现 → 当天收盘卖出。
+      只做多、同时最多一个仓位；持仓期间忽略新的 B，空仓期间忽略 S。
+    逐根 walk-forward 判定每根K线是否为 realtime B/S，再跑状态机。
+    返回每笔交易收益率、持有K线数，及每只股票的策略 vs 买入持有对照。"""
+    tickers = scan.load_universe()
+    data = scan.fetch_all(tickers)
+    rets, holds, per_ticker = [], [], []
+    left_open = 0
+    for t, df in data.items():
+        n = len(df)
+        if n < min_bars + 2:
+            continue
+        opens = [float(x) for x in df["Open"].tolist()]
+        closes = [float(x) for x in df["Close"].tolist()]
+        isB = [False] * n
+        isS = [False] * n
+        for i in range(min_bars - 1, n):
+            try:
+                cur = scan.compute_signals(df.iloc[:i + 1])
+            except Exception:
+                continue
+            if not cur["dates"]:
+                continue
+            last = cur["dates"][-1]
+            if last in set(cur["b_dates"]):
+                isB[i] = True
+            if last in set(cur["s_dates"]):
+                isS[i] = True
+
+        pos = False
+        entry = 0.0
+        entry_i = -1
+        eq = 1.0
+        tk_trades = 0
+        for i in range(min_bars - 1, n):
+            if not pos:
+                if isB[i] and i + 1 < n and opens[i + 1]:
+                    pos = True
+                    entry = opens[i + 1]
+                    entry_i = i + 1
+            else:
+                if isS[i] and i >= entry_i and entry:
+                    ret = (closes[i] - entry) / entry * 100
+                    rets.append(ret)
+                    holds.append(i - entry_i)
+                    eq *= (1 + ret / 100)
+                    tk_trades += 1
+                    pos = False
+        if pos:
+            left_open += 1
+        c0 = closes[min_bars - 1]
+        c1 = closes[n - 1]
+        bh = (c1 - c0) / c0 * 100 if c0 else 0.0
+        per_ticker.append({"tk": t, "strat": (eq - 1) * 100, "bh": bh, "trades": tk_trades})
+    return rets, holds, per_ticker, left_open, len(data), len(tickers)
+
+
 def _stats(name, arr):
     import statistics as st
     if not arr:
@@ -199,6 +258,31 @@ def main():
         _stats("  任意日做多", r["base"])
         print("\n注：realtime 组才是接近真实的收益（信号在该K线为最新时当场就出）；")
         print("    repainted 组把事后重绘冒出来的点也算进去，会显著高估。均未扣手续费/滑点。")
+        return
+
+    if "--strategy" in sys.argv:
+        import statistics as st
+        rets, holds, per, left, ok, tot = bs_strategy()
+        print("\n== 策略：B出现次日开盘买入 → 持有到S出现当天收盘卖出（全 realtime 信号）==")
+        print(f"数据覆盖：{ok}/{tot} 只 | 完成交易 {len(rets)} 笔 | 期末仍持仓未平 {left} 只\n")
+        if rets:
+            n = len(rets)
+            win = sum(1 for x in rets if x > 0) / n * 100
+            print(f"胜率           ：{win:.1f}%")
+            print(f"平均每笔收益   ：{sum(rets)/n:+.2f}%")
+            print(f"中位每笔收益   ：{st.median(rets):+.2f}%")
+            print(f"最大 / 最小    ：{max(rets):+.2f}% / {min(rets):+.2f}%")
+            print(f"平均持有       ：{sum(holds)/len(holds):.1f} 个交易日")
+            print(f"平均每股交易数 ：{n/max(1,ok):.1f} 笔")
+        avg_strat = sum(p["strat"] for p in per) / len(per) if per else 0
+        avg_bh = sum(p["bh"] for p in per) / len(per) if per else 0
+        beat = sum(1 for p in per if p["strat"] > p["bh"])
+        print(f"\n累计收益对照（每股把每次信号连续复利，2y 区间）：")
+        print(f"  策略平均总收益 ：{avg_strat:+.1f}%")
+        print(f"  买入持有平均   ：{avg_bh:+.1f}%")
+        print(f"  策略跑赢买入持有：{beat}/{len(per)} 只")
+        print("\n注：全用 realtime 信号（当天真出现的，非重绘定型）；未扣手续费/滑点；")
+        print("    只做多、单一仓位；期末未平仓的按未实现不计入交易统计。")
         return
 
     if "--repaint-in" in sys.argv:

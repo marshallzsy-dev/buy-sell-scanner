@@ -45,3 +45,13 @@ jobs:
             cat ri_result.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run B/S event-driven strategy
+        run: |
+          python analyze.py --strategy | tee strat_result.txt
+          {
+            echo "### 策略回测 · B次日开盘买入 → S当天收盘卖出（realtime 信号）"
+            echo '```'
+            cat strat_result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
