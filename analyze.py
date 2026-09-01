@@ -161,21 +161,78 @@ def repaint_in_analysis(rt_min_bars=60):
     return res, len(data), len(tickers)
 
 
-def bs_strategy(min_bars=60):
-    """事件驱动策略回测（全用 realtime 信号，剥掉重绘）：
-      B 信号当天出现 → 次日开盘买入；持有到 S 信号出现 → 当天收盘卖出。
-      只做多、同时最多一个仓位；持仓期间忽略新的 B，空仓期间忽略 S。
-    逐根 walk-forward 判定每根K线是否为 realtime B/S，再跑状态机。
-    返回每笔交易收益率、持有K线数，及每只股票的策略 vs 买入持有对照。"""
+def _argval(flag):
+    """从命令行取 --flag 后紧跟的数值，取不到或非数值返回 None。"""
+    if flag in sys.argv:
+        k = sys.argv.index(flag)
+        if k + 1 < len(sys.argv):
+            try:
+                return float(sys.argv[k + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def _sim_bs(isB, isS, opens, highs, lows, closes, n, min_bars, stop_pct, take_pct):
+    """单只股票、单套止损止盈配置的状态机模拟。
+      B→次日开盘买入；持仓期每根K线先查止损/止盈（跳空按开盘价、否则按止损/止盈价，
+      止损优先），未触发则遇 S 当天收盘卖出。stop_pct/take_pct 为 None 表示不设。
+    返回 (rets, holds, reasons, eq_total_pct, left_open)。"""
+    rets, holds = [], []
+    reasons = {"S": 0, "止损": 0, "止盈": 0}
+    pos = False
+    entry = 0.0
+    entry_i = -1
+    stop_lv = target_lv = None
+    eq = 1.0
+    for i in range(min_bars - 1, n):
+        if not pos:
+            if isB[i] and i + 1 < n and opens[i + 1]:
+                pos = True
+                entry = opens[i + 1]
+                entry_i = i + 1
+                stop_lv = entry * (1 - stop_pct / 100) if stop_pct else None
+                target_lv = entry * (1 + take_pct / 100) if take_pct else None
+            continue
+        exit_price = reason = None
+        if i > entry_i:                                  # 跳空：开盘已穿越
+            if stop_lv is not None and opens[i] <= stop_lv:
+                exit_price, reason = opens[i], "止损"
+            elif target_lv is not None and opens[i] >= target_lv:
+                exit_price, reason = opens[i], "止盈"
+        if exit_price is None:                           # 盘中触及（止损优先）
+            if stop_lv is not None and lows[i] <= stop_lv:
+                exit_price, reason = stop_lv, "止损"
+            elif target_lv is not None and highs[i] >= target_lv:
+                exit_price, reason = target_lv, "止盈"
+        if exit_price is None and isS[i]:                # S 出场
+            exit_price, reason = closes[i], "S"
+        if exit_price is not None:
+            ret = (exit_price - entry) / entry * 100
+            rets.append(ret)
+            holds.append(i - entry_i)
+            reasons[reason] += 1
+            eq *= (1 + ret / 100)
+            pos = False
+    return rets, holds, reasons, (eq - 1) * 100, (1 if pos else 0)
+
+
+def bs_strategy(configs, min_bars=60):
+    """事件驱动策略回测（全用 realtime 信号，剥掉重绘）。
+    一次抓数+walk-forward 判定 realtime B/S，然后对多套止损止盈配置分别模拟。
+      configs: [(label, stop_pct, take_pct), ...]
+    返回 {label: dict(rets,holds,reasons,per,left)} 与覆盖数。"""
     tickers = scan.load_universe()
     data = scan.fetch_all(tickers)
-    rets, holds, per_ticker = [], [], []
-    left_open = 0
+    out = {lab: {"rets": [], "holds": [], "reasons": {"S": 0, "止损": 0, "止盈": 0},
+                 "per": [], "left": 0} for lab, _, _ in configs}
     for t, df in data.items():
         n = len(df)
         if n < min_bars + 2:
             continue
         opens = [float(x) for x in df["Open"].tolist()]
+        highs = [float(x) for x in df["High"].tolist()]
+        lows = [float(x) for x in df["Low"].tolist()]
         closes = [float(x) for x in df["Close"].tolist()]
         isB = [False] * n
         isS = [False] * n
@@ -191,33 +248,19 @@ def bs_strategy(min_bars=60):
                 isB[i] = True
             if last in set(cur["s_dates"]):
                 isS[i] = True
-
-        pos = False
-        entry = 0.0
-        entry_i = -1
-        eq = 1.0
-        tk_trades = 0
-        for i in range(min_bars - 1, n):
-            if not pos:
-                if isB[i] and i + 1 < n and opens[i + 1]:
-                    pos = True
-                    entry = opens[i + 1]
-                    entry_i = i + 1
-            else:
-                if isS[i] and i >= entry_i and entry:
-                    ret = (closes[i] - entry) / entry * 100
-                    rets.append(ret)
-                    holds.append(i - entry_i)
-                    eq *= (1 + ret / 100)
-                    tk_trades += 1
-                    pos = False
-        if pos:
-            left_open += 1
-        c0 = closes[min_bars - 1]
-        c1 = closes[n - 1]
+        c0, c1 = closes[min_bars - 1], closes[n - 1]
         bh = (c1 - c0) / c0 * 100 if c0 else 0.0
-        per_ticker.append({"tk": t, "strat": (eq - 1) * 100, "bh": bh, "trades": tk_trades})
-    return rets, holds, per_ticker, left_open, len(data), len(tickers)
+        for lab, sp, tp in configs:
+            rets, holds, reasons, eq, left = _sim_bs(
+                isB, isS, opens, highs, lows, closes, n, min_bars, sp, tp)
+            o = out[lab]
+            o["rets"] += rets
+            o["holds"] += holds
+            for k in reasons:
+                o["reasons"][k] += reasons[k]
+            o["per"].append({"strat": eq, "bh": bh})
+            o["left"] += left
+    return out, len(data), len(tickers)
 
 
 def _stats(name, arr):
@@ -262,27 +305,33 @@ def main():
 
     if "--strategy" in sys.argv:
         import statistics as st
-        rets, holds, per, left, ok, tot = bs_strategy()
+        stop = _argval("--stop")
+        take = _argval("--take")
+        stop = 10.0 if stop is None else stop
+        take = 20.0 if take is None else take
+        configs = [("无止损止盈（基线）", None, None),
+                   (f"{stop:g}%止损 / {take:g}%止盈", stop, take)]
+        out, ok, tot = bs_strategy(configs)
         print("\n== 策略：B出现次日开盘买入 → 持有到S出现当天收盘卖出（全 realtime 信号）==")
-        print(f"数据覆盖：{ok}/{tot} 只 | 完成交易 {len(rets)} 笔 | 期末仍持仓未平 {left} 只\n")
-        if rets:
-            n = len(rets)
-            win = sum(1 for x in rets if x > 0) / n * 100
-            print(f"胜率           ：{win:.1f}%")
-            print(f"平均每笔收益   ：{sum(rets)/n:+.2f}%")
-            print(f"中位每笔收益   ：{st.median(rets):+.2f}%")
-            print(f"最大 / 最小    ：{max(rets):+.2f}% / {min(rets):+.2f}%")
-            print(f"平均持有       ：{sum(holds)/len(holds):.1f} 个交易日")
-            print(f"平均每股交易数 ：{n/max(1,ok):.1f} 笔")
-        avg_strat = sum(p["strat"] for p in per) / len(per) if per else 0
-        avg_bh = sum(p["bh"] for p in per) / len(per) if per else 0
-        beat = sum(1 for p in per if p["strat"] > p["bh"])
-        print(f"\n累计收益对照（每股把每次信号连续复利，2y 区间）：")
-        print(f"  策略平均总收益 ：{avg_strat:+.1f}%")
-        print(f"  买入持有平均   ：{avg_bh:+.1f}%")
-        print(f"  策略跑赢买入持有：{beat}/{len(per)} 只")
-        print("\n注：全用 realtime 信号（当天真出现的，非重绘定型）；未扣手续费/滑点；")
-        print("    只做多、单一仓位；期末未平仓的按未实现不计入交易统计。")
+        print(f"数据覆盖：{ok}/{tot} 只\n")
+        for lab, _, _ in configs:
+            o = out[lab]
+            rets, holds, per = o["rets"], o["holds"], o["per"]
+            print(f"—— {lab} ——")
+            if rets:
+                n = len(rets)
+                win = sum(1 for x in rets if x > 0) / n * 100
+                avg_strat = sum(p["strat"] for p in per) / len(per)
+                avg_bh = sum(p["bh"] for p in per) / len(per)
+                beat = sum(1 for p in per if p["strat"] > p["bh"])
+                rs = o["reasons"]
+                print(f"  完成交易 {n} 笔 | 期末未平 {o['left']} 只 | 平均持有 {sum(holds)/len(holds):.1f} 交易日")
+                print(f"  胜率 {win:.1f}% | 平均每笔 {sum(rets)/n:+.2f}% | 中位 {st.median(rets):+.2f}% | 区间 {min(rets):+.1f}%~{max(rets):+.1f}%")
+                print(f"  出场构成：S {rs['S']} / 止盈 {rs['止盈']} / 止损 {rs['止损']}")
+                print(f"  累计(每股复利)：策略 {avg_strat:+.1f}% vs 买入持有 {avg_bh:+.1f}% | 跑赢 {beat}/{len(per)} 只")
+            print()
+        print("注：全用 realtime 信号；止损止盈用当日高低价、跳空按开盘价、止损优先；")
+        print("    未扣手续费/滑点；只做多、单一仓位；期末未平仓不计入交易统计。")
         return
 
     if "--repaint-in" in sys.argv:

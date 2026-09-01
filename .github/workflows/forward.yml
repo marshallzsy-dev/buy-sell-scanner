@@ -10,6 +10,14 @@ on:
         description: '持有交易日数（默认 5）'
         required: false
         default: '5'
+      stop:
+        description: '策略止损百分比（默认 10）'
+        required: false
+        default: '10'
+      take:
+        description: '策略止盈百分比（默认 20）'
+        required: false
+        default: '20'
 
 jobs:
   forward:
@@ -48,7 +56,7 @@ jobs:
 
       - name: Run B/S event-driven strategy
         run: |
-          python analyze.py --strategy | tee strat_result.txt
+          python analyze.py --strategy --stop "${{ inputs.stop }}" --take "${{ inputs.take }}" | tee strat_result.txt
           {
             echo "### 策略回测 · B次日开盘买入 → S当天收盘卖出（realtime 信号）"
             echo '```'
