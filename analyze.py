@@ -217,6 +217,100 @@ def _sim_bs(isB, isS, opens, highs, lows, closes, n, min_bars, stop_pct, take_pc
     return rets, holds, reasons, (eq - 1) * 100, (1 if pos else 0)
 
 
+def _sim_lab(isB, isS, opens, closes, sma_val, n, min_bars, params):
+    """通用做多状态机：
+      entry：realtime B 次日开盘买入；可选趋势过滤(仅当 B 日收盘 > SMA 才入场)。
+      exit ：以下先到者——S 信号(收盘)、或从入场后收盘最高点回撤 trail%(移动止损，收盘触发)。
+      不设固定止盈(保住右尾)。params: {trail, sma, use_s}。"""
+    trail = params.get("trail")
+    sma = params.get("sma")
+    use_s = params.get("use_s", True)
+    rets, holds = [], []
+    reasons = {"S": 0, "移动止损": 0}
+    pos = False
+    entry = 0.0
+    entry_i = -1
+    peak = 0.0
+    eq = 1.0
+    for i in range(min_bars - 1, n):
+        if not pos:
+            if isB[i] and i + 1 < n and opens[i + 1]:
+                if sma is not None:
+                    sv = sma_val[i]
+                    if sv is None or closes[i] <= sv:
+                        continue
+                pos = True
+                entry = opens[i + 1]
+                entry_i = i + 1
+                peak = 0.0
+            continue
+        c = closes[i]
+        if c > peak:
+            peak = c
+        trailing = trail is not None and peak > 0 and c <= peak * (1 - trail / 100)
+        s_trig = use_s and isS[i]
+        if trailing or s_trig:
+            reason = "移动止损" if trailing else "S"
+            ret = (c - entry) / entry * 100
+            rets.append(ret)
+            holds.append(i - entry_i)
+            reasons[reason] += 1
+            eq *= (1 + ret / 100)
+            pos = False
+    return rets, holds, reasons, (eq - 1) * 100, (1 if pos else 0)
+
+
+def strategy_lab(configs, min_bars=60):
+    """一次抓数+walk-forward 判定 realtime B/S，对多套策略配置分别模拟。
+      configs: [(label, params_dict), ...]"""
+    tickers = scan.load_universe()
+    data = scan.fetch_all(tickers)
+    out = {lab: {"rets": [], "holds": [], "reasons": {"S": 0, "移动止损": 0},
+                 "per": [], "left": 0} for lab, _ in configs}
+    for t, df in data.items():
+        n = len(df)
+        if n < min_bars + 2:
+            continue
+        opens = [float(x) for x in df["Open"].tolist()]
+        closes = [float(x) for x in df["Close"].tolist()]
+        # SMA200（趋势过滤用）
+        sma_val = [None] * n
+        win = 200
+        if n >= win:
+            s = sum(closes[:win])
+            sma_val[win - 1] = s / win
+            for i in range(win, n):
+                s += closes[i] - closes[i - win]
+                sma_val[i] = s / win
+        isB = [False] * n
+        isS = [False] * n
+        for i in range(min_bars - 1, n):
+            try:
+                cur = scan.compute_signals(df.iloc[:i + 1])
+            except Exception:
+                continue
+            if not cur["dates"]:
+                continue
+            last = cur["dates"][-1]
+            if last in set(cur["b_dates"]):
+                isB[i] = True
+            if last in set(cur["s_dates"]):
+                isS[i] = True
+        c0, c1 = closes[min_bars - 1], closes[n - 1]
+        bh = (c1 - c0) / c0 * 100 if c0 else 0.0
+        for lab, params in configs:
+            rets, holds, reasons, eq, left = _sim_lab(
+                isB, isS, opens, closes, sma_val, n, min_bars, params)
+            o = out[lab]
+            o["rets"] += rets
+            o["holds"] += holds
+            for k in reasons:
+                o["reasons"][k] += reasons[k]
+            o["per"].append({"strat": eq, "bh": bh})
+            o["left"] += left
+    return out, len(data), len(tickers)
+
+
 def bs_strategy(configs, min_bars=60):
     """事件驱动策略回测（全用 realtime 信号，剥掉重绘）。
     一次抓数+walk-forward 判定 realtime B/S，然后对多套止损止盈配置分别模拟。
@@ -301,6 +395,37 @@ def main():
         _stats("  任意日做多", r["base"])
         print("\n注：realtime 组才是接近真实的收益（信号在该K线为最新时当场就出）；")
         print("    repainted 组把事后重绘冒出来的点也算进去，会显著高估。均未扣手续费/滑点。")
+        return
+
+    if "--lab" in sys.argv:
+        import statistics as st
+        configs = [
+            ("B→S 基线(无止损)",              {}),
+            ("B→S +25%移动止损",             {"trail": 25}),
+            ("B→S +15%移动止损",             {"trail": 15}),
+            ("仅15%移动止损(忽略S)",          {"trail": 15, "use_s": False}),
+            ("趋势>SMA200 +15%移动止损",      {"trail": 15, "sma": 200}),
+        ]
+        out, ok, tot = strategy_lab(configs)
+        print("\n== 策略实验室：B次日开盘买入，多种出场/过滤对照（全 realtime 信号）==")
+        print(f"数据覆盖：{ok}/{tot} 只\n")
+        print(f"{'配置':<26}{'笔数':>6}{'胜率':>7}{'平均':>8}{'中位':>8}{'最差':>8}{'累计':>8}{'跑赢BH':>8}")
+        for lab, _ in configs:
+            o = out[lab]
+            r = o["rets"]
+            if not r:
+                print(f"{lab:<26} 无样本"); continue
+            n = len(r)
+            win = sum(1 for x in r if x > 0) / n * 100
+            per = o["per"]
+            avg_strat = sum(p["strat"] for p in per) / len(per)
+            beat = sum(1 for p in per if p["strat"] > p["bh"])
+            print(f"{lab:<26}{n:>6}{win:>6.1f}%{sum(r)/n:>7.2f}%{st.median(r):>7.2f}%"
+                  f"{min(r):>7.1f}%{avg_strat:>7.1f}%{beat:>5}/{len(per)}")
+        bh_avg = sum(p["bh"] for p in out[configs[0][0]]["per"]) / len(out[configs[0][0]]["per"])
+        print(f"\n买入持有平均总收益（对照基准）：{bh_avg:+.1f}%")
+        print("列说明：平均/中位=每笔收益，最差=单笔最大亏损，累计=每股复利平均总收益。")
+        print("全 realtime 信号；移动止损=收盘从入场后最高收盘回撤N%；不设固定止盈；未扣费。")
         return
 
     if "--strategy" in sys.argv:

@@ -54,6 +54,16 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Run strategy lab (multiple variants)
+        run: |
+          python analyze.py --lab | tee lab_result.txt
+          {
+            echo "### 策略实验室 · 多变体对照（移动止损/趋势过滤 vs 买入持有）"
+            echo '```'
+            cat lab_result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run B/S event-driven strategy
         run: |
           python analyze.py --strategy --stop "${{ inputs.stop }}" --take "${{ inputs.take }}" | tee strat_result.txt
