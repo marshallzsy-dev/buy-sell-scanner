@@ -57,62 +57,77 @@ def compute_from_history():
     return buckets, dates
 
 
-def forward_returns(hold=5):
-    """出 B/S 信号后「第二天开盘入场」、持有 hold 个交易日、末日收盘平仓的收益率。
-      B（做多）：(exit_close - entry_open) / entry_open
-      S（做空）：(entry_open - exit_close) / entry_open
-    用 yfinance 抓 2y 日线 + 同一套 compute_signals 复算信号。
-    注意：信号取自「当前全量历史」= 已重绘定型的位置，含 lookahead，属乐观估计。"""
+def forward_all(hold=5, rt_min_bars=60):
+    """一次抓数，算「出信号→次日开盘入场→持有 hold 交易日→末日收盘平仓」的收益率。
+      B（做多）：(exit_close - entry_open)/entry_open
+      S（做空）：(entry_open - exit_close)/entry_open
+    同时给出两口径：
+      repainted 全量：用当前全量历史算出的（已重绘定型）全部信号——含 lookahead，乐观上限。
+      realtime 当天：walk-forward 逐根截断重算，只取「该K线为最新时当场就出的」信号——
+                     实时真能下单的，剥掉了事后重绘冒出来的点，接近真实。
+    base：任意日次日开盘做多持有 hold 日，作对照。"""
     tickers = scan.load_universe()
     data = scan.fetch_all(tickers)
 
-    b_ret, s_ret, base = [], [], []
+    rp_b, rp_s, base, rt_b, rt_s = [], [], [], [], []
     for t, df in data.items():
-        try:
-            cur = scan.compute_signals(df)
-        except Exception:
-            continue
-        dates = cur["dates"]
-        closes = cur["closes"]
         opens = [float(x) for x in df["Open"].tolist()]
-        n = len(dates)
-        if n != len(opens) or n < hold + 2:
+        closes = [float(x) for x in df["Close"].tolist()]
+        n = len(df)
+        if n != len(opens) or n < rt_min_bars + hold + 2:
             continue
-        idx = {d: i for i, d in enumerate(dates)}
 
-        # 基线：任意一天次日开盘做多、持有 hold 日的收益（对照组）
-        for i in range(0, n - hold - 1):
-            eo = opens[i + 1]
-            if eo:
-                base.append((closes[i + hold] - eo) / eo * 100)
+        # --- repainted 全量 + 基线 ---
+        try:
+            full = scan.compute_signals(df)
+        except Exception:
+            full = None
+        if full and len(full["dates"]) == n:
+            idx = {d: i for i, d in enumerate(full["dates"])}
+            for i in range(0, n - hold - 1):
+                eo = opens[i + 1]
+                if eo:
+                    base.append((closes[i + hold] - eo) / eo * 100)
+            for d in full["b_dates"]:
+                i = idx.get(d)
+                if i is not None and i + hold < n and opens[i + 1]:
+                    rp_b.append((closes[i + hold] - opens[i + 1]) / opens[i + 1] * 100)
+            for d in full["s_dates"]:
+                i = idx.get(d)
+                if i is not None and i + hold < n and opens[i + 1]:
+                    rp_s.append((opens[i + 1] - closes[i + hold]) / opens[i + 1] * 100)
 
-        for d in cur["b_dates"]:
-            i = idx.get(d)
-            if i is None or i + hold >= n:
-                continue
+        # --- realtime 当天：逐根截断重算，看最新那根是否当场出信号 ---
+        for i in range(rt_min_bars - 1, n - hold - 1):
             eo = opens[i + 1]
-            if eo:
-                b_ret.append((closes[i + hold] - eo) / eo * 100)
-        for d in cur["s_dates"]:
-            i = idx.get(d)
-            if i is None or i + hold >= n:
+            if not eo:
                 continue
-            eo = opens[i + 1]
-            if eo:
-                s_ret.append((eo - closes[i + hold]) / eo * 100)
-    return b_ret, s_ret, base, len(data), len(tickers)
+            try:
+                cur = scan.compute_signals(df.iloc[:i + 1])
+            except Exception:
+                continue
+            if not cur["dates"]:
+                continue
+            last = cur["dates"][-1]
+            if last in set(cur["b_dates"]):
+                rt_b.append((closes[i + hold] - eo) / eo * 100)
+            if last in set(cur["s_dates"]):
+                rt_s.append((eo - closes[i + hold]) / eo * 100)
+
+    return dict(rp_b=rp_b, rp_s=rp_s, base=base, rt_b=rt_b, rt_s=rt_s,
+                ok=len(data), tot=len(tickers))
 
 
 def _stats(name, arr):
     import statistics as st
     if not arr:
-        print(f"{name:<22} 无样本")
+        print(f"{name:<24} 无样本")
         return
     n = len(arr)
     mean = sum(arr) / n
     med = st.median(arr)
     win = sum(1 for x in arr if x > 0) / n * 100
-    print(f"{name:<22}{n:>7}{mean:>9.2f}%{med:>9.2f}%{win:>8.1f}%")
+    print(f"{name:<24}{n:>7}{mean:>9.2f}%{med:>9.2f}%{win:>8.1f}%")
 
 
 def main():
@@ -124,15 +139,23 @@ def main():
     if "--forward" in sys.argv:
         args = sys.argv[sys.argv.index("--forward") + 1:]
         hold = int(args[0]) if args and args[0].isdigit() else 5
-        b, s, base, ok, tot = forward_returns(hold)
+        r = forward_all(hold)
         print(f"\n== 出信号→次日开盘入场→持有 {hold} 个交易日→末日收盘平仓 ==")
-        print(f"数据覆盖：{ok}/{tot} 只，全 2y 历史信号\n")
-        print(f"{'':<22}{'样本':>7}{'平均':>10}{'中位':>10}{'胜率':>9}")
-        _stats("B 买点 (做多)", b)
-        _stats("S 卖点 (做空)", s)
-        _stats("基线 (任意日做多)", base)
-        print("\n注：信号取自当前全量历史（已重绘定型），含 lookahead，为乐观上限；")
-        print("    真实交易需扣手续费/滑点，且实时信号可能当日尚未出现或次日重绘消失。")
+        print(f"数据覆盖：{r['ok']}/{r['tot']} 只\n")
+        hdr = f"{'':<24}{'样本':>7}{'平均':>10}{'中位':>10}{'胜率':>9}"
+        print("【realtime 当天出的信号 · 实时可交易，剥掉重绘】")
+        print(hdr)
+        _stats("  B 买点 (做多)", r["rt_b"])
+        _stats("  S 卖点 (做空)", r["rt_s"])
+        print("\n【repainted 全量历史信号 · 含 lookahead，乐观上限】")
+        print(hdr)
+        _stats("  B 买点 (做多)", r["rp_b"])
+        _stats("  S 卖点 (做空)", r["rp_s"])
+        print("\n【基线对照】")
+        print(hdr)
+        _stats("  任意日做多", r["base"])
+        print("\n注：realtime 组才是接近真实的收益（信号在该K线为最新时当场就出）；")
+        print("    repainted 组把事后重绘冒出来的点也算进去，会显著高估。均未扣手续费/滑点。")
         return
 
     buckets, dates = compute_from_history()
