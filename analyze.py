@@ -225,6 +225,7 @@ def _sim_lab(isB, isS, opens, closes, sma_val, n, min_bars, params):
     trail = params.get("trail")
     sma = params.get("sma")
     use_s = params.get("use_s", True)
+    partial_s = params.get("partial_s", 0.0)   # >0：首个 S 卖出该比例锁利，其余挂移动止损续持
     rets, holds = [], []
     reasons = {"S": 0, "移动止损": 0}
     pos = False
@@ -232,6 +233,8 @@ def _sim_lab(isB, isS, opens, closes, sma_val, n, min_bars, params):
     entry_i = -1
     peak = 0.0
     eq = 1.0
+    s_taken = False
+    s_leg = 0.0
     for i in range(min_bars - 1, n):
         if not pos:
             if isB[i] and i + 1 < n and opens[i + 1]:
@@ -243,20 +246,37 @@ def _sim_lab(isB, isS, opens, closes, sma_val, n, min_bars, params):
                 entry = opens[i + 1]
                 entry_i = i + 1
                 peak = 0.0
+                s_taken = False
+                s_leg = 0.0
             continue
         c = closes[i]
         if c > peak:
             peak = c
         trailing = trail is not None and peak > 0 and c <= peak * (1 - trail / 100)
         s_trig = use_s and isS[i]
-        if trailing or s_trig:
-            reason = "移动止损" if trailing else "S"
-            ret = (c - entry) / entry * 100
-            rets.append(ret)
-            holds.append(i - entry_i)
-            reasons[reason] += 1
-            eq *= (1 + ret / 100)
-            pos = False
+
+        if partial_s > 0:
+            # 分批：首个 S 先卖 partial_s 比例（锁利），剩余仓位继续用移动止损跑
+            if s_trig and not s_taken:
+                s_leg = (c - entry) / entry * 100
+                s_taken = True
+            if trailing:
+                trail_leg = (c - entry) / entry * 100
+                ret = (partial_s * s_leg + (1 - partial_s) * trail_leg) if s_taken else trail_leg
+                rets.append(ret)
+                holds.append(i - entry_i)
+                reasons["移动止损"] += 1
+                eq *= (1 + ret / 100)
+                pos = False
+        else:
+            if trailing or s_trig:
+                reason = "移动止损" if trailing else "S"
+                ret = (c - entry) / entry * 100
+                rets.append(ret)
+                holds.append(i - entry_i)
+                reasons[reason] += 1
+                eq *= (1 + ret / 100)
+                pos = False
     return rets, holds, reasons, (eq - 1) * 100, (1 if pos else 0)
 
 
@@ -416,26 +436,29 @@ def main():
             ("B→S 基线(参考)",                {}),
             ("趋势跟随 10%移动止损",          {"trail": 10, "use_s": False}),
             ("趋势跟随 15%移动止损",          {"trail": 15, "use_s": False}),
-            ("趋势跟随 20%移动止损",          {"trail": 20, "use_s": False}),
-            ("趋势跟随 25%移动止损",          {"trail": 25, "use_s": False}),
-            ("趋势跟随 20%+SMA200过滤",       {"trail": 20, "use_s": False, "sma": 200}),
+            ("分批: S卖半仓+半仓10%移动",     {"trail": 10, "partial_s": 0.5}),
+            ("分批: S卖半仓+半仓15%移动",     {"trail": 15, "partial_s": 0.5}),
         ]
         out, ok, tot = strategy_lab(configs)
-        print("\n== 策略实验室：B次日开盘买入，多种出场/过滤对照（全 realtime 信号）==")
-        print(f"数据覆盖：{ok}/{tot} 只\n")
-        print(f"{'配置':<26}{'笔数':>6}{'胜率':>7}{'平均':>8}{'中位':>8}{'最差':>8}{'累计':>8}{'跑赢BH':>8}")
+        print("\n== 策略实验室：B次日开盘买入，多种出场对照（全 realtime 信号）==")
+        print(f"数据覆盖：{ok}/{tot} 只  （盈亏比=均赢÷|均亏|，期望=平均每笔）\n")
+        print(f"{'配置':<28}{'笔数':>6}{'胜率':>7}{'盈亏比':>7}{'均赢':>7}{'均亏':>7}{'期望':>7}{'累计':>7}")
         for lab, _ in configs:
             o = out[lab]
             r = o["rets"]
             if not r:
-                print(f"{lab:<26} 无样本"); continue
+                print(f"{lab:<28} 无样本"); continue
             n = len(r)
-            win = sum(1 for x in r if x > 0) / n * 100
+            wins = [x for x in r if x > 0]
+            losses = [x for x in r if x <= 0]
+            win = len(wins) / n * 100
+            aw = sum(wins) / len(wins) if wins else 0
+            al = sum(losses) / len(losses) if losses else 0
+            payoff = (aw / abs(al)) if al else float("inf")
             per = o["per"]
             avg_strat = sum(p["strat"] for p in per) / len(per)
-            beat = sum(1 for p in per if p["strat"] > p["bh"])
-            print(f"{lab:<26}{n:>6}{win:>6.1f}%{sum(r)/n:>7.2f}%{st.median(r):>7.2f}%"
-                  f"{min(r):>7.1f}%{avg_strat:>7.1f}%{beat:>5}/{len(per)}")
+            print(f"{lab:<28}{n:>6}{win:>6.1f}%{payoff:>7.2f}{aw:>6.1f}%{al:>6.1f}%"
+                  f"{sum(r)/n:>6.2f}%{avg_strat:>6.1f}%")
         bh_avg = sum(p["bh"] for p in out[configs[0][0]]["per"]) / len(out[configs[0][0]]["per"])
         print(f"\n买入持有平均总收益（对照基准）：{bh_avg:+.1f}%")
         print("列说明：平均/中位=每笔收益，最差=单笔最大亏损，累计=每股复利平均总收益。")
