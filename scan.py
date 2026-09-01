@@ -34,6 +34,13 @@ VENDOR_JS = os.path.join(VENDOR_DIR, "lightweight-charts.js")
 LWC_CDN = "https://unpkg.com/lightweight-charts@5.0.4/dist/lightweight-charts.standalone.production.js"
 LIVE_URL = "https://marshallzsy-dev.github.io/buy-sell-scanner/"  # 线上 dashboard 地址
 
+# 重绘率统计：按「信号距最新K线的天数」分桶
+REPAINT_BUCKET_ORDER = ["0-1", "2-3", "4-5", "6-10", "11-20", ">20"]
+BUCKET_LABELS = {
+    "0-1": "0–1天(最新边缘)", "2-3": "2–3天", "4-5": "4–5天",
+    "6-10": "6–10天", "11-20": "11–20天", ">20": ">20天(老信号)",
+}
+
 RECENT_DAYS = 3          # 「近三日」窗口（交易日）
 DISAPPEAR_LOOKBACK = 15  # 只对最近 N 个交易日内的信号消失发 Warning
 WARN_KEEP_DAYS = 7       # Warning 在页面上保留的天数（按检测日历日）
@@ -215,6 +222,53 @@ def detect_disappearances(ticker, prev, cur, today_str):
     return warnings
 
 
+def repaint_age_bucket(age_days):
+    if age_days <= 1: return "0-1"
+    if age_days <= 3: return "2-3"
+    if age_days <= 5: return "4-5"
+    if age_days <= 10: return "6-10"
+    if age_days <= 20: return "11-20"
+    return ">20"
+
+
+def _pdate(s):
+    try:
+        return dt.date.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def tally_repaint(prev_tickers, cur_tickers):
+    """比较相邻两日快照：prev 里已出现的 B/S 点，在 cur 里是否还在（消失=重绘）。
+    按信号距 prev 那天最新K线的天数分桶，返回 {bucket: [样本数, 消失数]}。
+    只统计两天都成功抓到数据的股票，避免把"当天抓取失败"误判为消失。"""
+    out = {}
+    for t, pv in prev_tickers.items():
+        cv = cur_tickers.get(t)
+        if not cv:
+            continue
+        pdl = _pdate(pv.get("data_last"))
+        cdl = _pdate(cv.get("data_last"))
+        if not pdl:
+            continue
+        for side, key in (("B", "b_dates"), ("S", "s_dates")):
+            cur_set = set(cv.get(key, []))
+            for bd in pv.get(key, []):
+                d = _pdate(bd)
+                if not d:
+                    continue
+                age = (pdl - d).days
+                if age < 0:
+                    continue
+                if cdl and d > cdl:   # 该K线已滚出当前数据窗口，不计
+                    continue
+                slot = out.setdefault(repaint_age_bucket(age), [0, 0])
+                slot[0] += 1
+                if bd not in cur_set:
+                    slot[1] += 1
+    return out
+
+
 def merge_warnings(existing, new_ones, today):
     """合并去重，丢弃超过 WARN_KEEP_DAYS 天的旧告警。"""
     def key(w):
@@ -326,6 +380,32 @@ def render_html(b_list, s_list, warnings, meta, chart_data):
     warn_rows = "\n".join(row_warn(w) for w in warnings) or \
         '<tr><td colspan="4" class="empty">暂无消失记录（需累积历史快照，运行几天后逐步显现）</td></tr>'
 
+    # 重绘率表（信号可靠性）
+    rs = meta.get("repaint_stats") or {}
+    rbk = rs.get("buckets") or {}
+    if rbk and rs.get("transitions"):
+        rr = []
+        tin = tg = 0
+        for k in REPAINT_BUCKET_ORDER:
+            if k in rbk:
+                n, g = rbk[k]
+                tin += n; tg += g
+                rate = g / n * 100 if n else 0
+                color = "#5fd98a" if rate < 2 else ("#f0a020" if rate < 12 else "#f07fce")
+                rr.append(f'<tr><td>{BUCKET_LABELS[k]}</td><td class="num">{n}</td>'
+                          f'<td class="num">{g}</td>'
+                          f'<td class="num" style="color:{color}">{rate:.1f}%</td></tr>')
+        trate = tg / tin * 100 if tin else 0
+        rr.append(f'<tr><td style="font-weight:600">合计</td>'
+                  f'<td class="num" style="font-weight:600">{tin}</td>'
+                  f'<td class="num" style="font-weight:600">{tg}</td>'
+                  f'<td class="num" style="font-weight:600">{trate:.1f}%</td></tr>')
+        rp_rows = "\n".join(rr)
+        rp_note = f"{rs.get('transitions')} 个交易日累积 · {rs.get('since')}~{rs.get('updated')}"
+    else:
+        rp_rows = '<tr><td colspan="4" class="empty">重绘统计累积中（需多日快照，运行几天后逐步显现）</td></tr>'
+        rp_note = "累积中"
+
     skipped = meta["skipped"]
     skipped_txt = "、".join(skipped) if skipped else "无"
 
@@ -428,6 +508,18 @@ def render_html(b_list, s_list, warnings, meta, chart_data):
       <thead><tr><th>代码</th><th>类型</th><th>消失节点(K线日期)</th><th>检测于</th></tr></thead>
       <tbody>{warn_rows}</tbody>
     </table>
+  </section>
+
+  <section>
+    <div class="stitle"><span class="dot" style="background:#58a6ff"></span> 信号可靠性 · 重绘消失率 by 信号年龄 <span class="cnt">（{rp_note}）</span></div>
+    <table>
+      <thead><tr><th>信号年龄</th><th>样本</th><th>消失</th><th>消失率</th></tr></thead>
+      <tbody>{rp_rows}</tbody>
+    </table>
+    <div style="color:var(--muted);font-size:11px;padding:8px 2px 2px;line-height:1.6;">
+      · 统计「相邻交易日之间，已出现的 B/S 点是否重绘消失」，按信号距最新 K 线的天数分桶，云端每日累积。<br>
+      · 越新的信号越易重绘：<b>0–1 天最不稳，熬过约 5 个交易日基本稳定</b>——可当作「信号可信度」参考，别追当天新点。
+    </div>
   </section>
 
   <footer>
@@ -720,6 +812,20 @@ def main():
         if t not in chart_data and t in computed and t in data:
             chart_data[t] = build_chart_data(data[t], computed[t])
 
+    # 重绘率统计：把「昨日→今日」这一步的信号存活情况累积进 state（云端逐日累积，供 dashboard 展示）。
+    # 用 prev_run < today 作闸：同一天重复跑（如手动 dispatch 多次）不会重复计入。
+    prev_run = next((v.get("run_date") for v in prev_tickers.values() if v.get("run_date")), None)
+    rstats = state.get("repaint_stats") or {"buckets": {}, "transitions": 0, "since": None, "updated": None}
+    if prev_run and prev_run < today_str:
+        day_t = tally_repaint(prev_tickers, new_tickers_state)
+        if day_t:
+            for b, (tot, gone) in day_t.items():
+                cur = rstats["buckets"].get(b, [0, 0])
+                rstats["buckets"][b] = [cur[0] + tot, cur[1] + gone]
+            rstats["transitions"] = rstats.get("transitions", 0) + 1
+            rstats["since"] = rstats.get("since") or prev_run
+            rstats["updated"] = today_str
+
     meta = {
         "run_et": et,
         "data_last": data_last or "-",
@@ -727,6 +833,7 @@ def main():
         "ok_n": len(data),
         "skipped": skipped,
         "lwc_lib": load_lwc_lib(),
+        "repaint_stats": rstats,
     }
     html = render_html(b_list, s_list, warnings, meta, chart_data)
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
@@ -736,6 +843,7 @@ def main():
     state["last_run"] = et.strftime("%Y-%m-%d %H:%M ET")
     state["tickers"] = new_tickers_state
     state["warnings"] = warnings
+    state["repaint_stats"] = rstats
     save_state(state)
 
     # 邮件正文 + 主题（供 CI 发信；本地跑也会生成，无害）
