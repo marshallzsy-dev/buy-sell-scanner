@@ -57,11 +57,83 @@ def compute_from_history():
     return buckets, dates
 
 
+def forward_returns(hold=5):
+    """出 B/S 信号后「第二天开盘入场」、持有 hold 个交易日、末日收盘平仓的收益率。
+      B（做多）：(exit_close - entry_open) / entry_open
+      S（做空）：(entry_open - exit_close) / entry_open
+    用 yfinance 抓 2y 日线 + 同一套 compute_signals 复算信号。
+    注意：信号取自「当前全量历史」= 已重绘定型的位置，含 lookahead，属乐观估计。"""
+    tickers = scan.load_universe()
+    data = scan.fetch_all(tickers)
+
+    b_ret, s_ret, base = [], [], []
+    for t, df in data.items():
+        try:
+            cur = scan.compute_signals(df)
+        except Exception:
+            continue
+        dates = cur["dates"]
+        closes = cur["closes"]
+        opens = [float(x) for x in df["Open"].tolist()]
+        n = len(dates)
+        if n != len(opens) or n < hold + 2:
+            continue
+        idx = {d: i for i, d in enumerate(dates)}
+
+        # 基线：任意一天次日开盘做多、持有 hold 日的收益（对照组）
+        for i in range(0, n - hold - 1):
+            eo = opens[i + 1]
+            if eo:
+                base.append((closes[i + hold] - eo) / eo * 100)
+
+        for d in cur["b_dates"]:
+            i = idx.get(d)
+            if i is None or i + hold >= n:
+                continue
+            eo = opens[i + 1]
+            if eo:
+                b_ret.append((closes[i + hold] - eo) / eo * 100)
+        for d in cur["s_dates"]:
+            i = idx.get(d)
+            if i is None or i + hold >= n:
+                continue
+            eo = opens[i + 1]
+            if eo:
+                s_ret.append((eo - closes[i + hold]) / eo * 100)
+    return b_ret, s_ret, base, len(data), len(tickers)
+
+
+def _stats(name, arr):
+    import statistics as st
+    if not arr:
+        print(f"{name:<22} 无样本")
+        return
+    n = len(arr)
+    mean = sum(arr) / n
+    med = st.median(arr)
+    win = sum(1 for x in arr if x > 0) / n * 100
+    print(f"{name:<22}{n:>7}{mean:>9.2f}%{med:>9.2f}%{win:>8.1f}%")
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+    if "--forward" in sys.argv:
+        args = sys.argv[sys.argv.index("--forward") + 1:]
+        hold = int(args[0]) if args and args[0].isdigit() else 5
+        b, s, base, ok, tot = forward_returns(hold)
+        print(f"\n== 出信号→次日开盘入场→持有 {hold} 个交易日→末日收盘平仓 ==")
+        print(f"数据覆盖：{ok}/{tot} 只，全 2y 历史信号\n")
+        print(f"{'':<22}{'样本':>7}{'平均':>10}{'中位':>10}{'胜率':>9}")
+        _stats("B 买点 (做多)", b)
+        _stats("S 卖点 (做空)", s)
+        _stats("基线 (任意日做多)", base)
+        print("\n注：信号取自当前全量历史（已重绘定型），含 lookahead，为乐观上限；")
+        print("    真实交易需扣手续费/滑点，且实时信号可能当日尚未出现或次日重绘消失。")
+        return
 
     buckets, dates = compute_from_history()
 
