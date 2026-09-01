@@ -400,11 +400,12 @@ def main():
     if "--lab" in sys.argv:
         import statistics as st
         configs = [
-            ("B→S 基线(无止损)",              {}),
-            ("B→S +25%移动止损",             {"trail": 25}),
-            ("B→S +15%移动止损",             {"trail": 15}),
-            ("仅15%移动止损(忽略S)",          {"trail": 15, "use_s": False}),
-            ("趋势>SMA200 +15%移动止损",      {"trail": 15, "sma": 200}),
+            ("B→S 基线(参考)",                {}),
+            ("趋势跟随 10%移动止损",          {"trail": 10, "use_s": False}),
+            ("趋势跟随 15%移动止损",          {"trail": 15, "use_s": False}),
+            ("趋势跟随 20%移动止损",          {"trail": 20, "use_s": False}),
+            ("趋势跟随 25%移动止损",          {"trail": 25, "use_s": False}),
+            ("趋势跟随 20%+SMA200过滤",       {"trail": 20, "use_s": False, "sma": 200}),
         ]
         out, ok, tot = strategy_lab(configs)
         print("\n== 策略实验室：B次日开盘买入，多种出场/过滤对照（全 realtime 信号）==")
