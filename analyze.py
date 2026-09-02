@@ -183,8 +183,22 @@ def events_in_window(start_str, end_str, rt_min_bars=60):
             return False
         return start <= d <= end
 
-    agg = {"B": {"native": 0, "repaint_in": 0, "gone": 0},
-           "S": {"native": 0, "repaint_in": 0, "gone": 0}}
+    AGE_ORDER = ["0-1", "2-3", "4-5", "6-10", ">10"]
+    def _age_bucket(a):
+        if a <= 1: return "0-1"
+        if a <= 3: return "2-3"
+        if a <= 5: return "4-5"
+        if a <= 10: return "6-10"
+        return ">10"
+
+    def _new_side():
+        return {"native": 0, "repaint_in": 0, "gone": 0,
+                # 原生信号最终是否存活到最新数据（=现在图上还在不在）
+                "nat_survive": 0, "nat_die": 0,
+                # 消失事件按「消失时信号年龄(交易日)」分桶
+                "gone_age": {k: 0 for k in AGE_ORDER}}
+
+    agg = {"B": _new_side(), "S": _new_side()}
     per = {}   # ticker -> 同结构
     for t, df in data.items():
         n = len(df)
@@ -197,8 +211,10 @@ def events_in_window(start_str, end_str, rt_min_bars=60):
         if not full["dates"] or len(full["dates"]) != n:
             continue
         cal = full["dates"]                       # 交易日日历（=最新K线日期序列）
-        p = {"B": {"native": 0, "repaint_in": 0, "gone": 0},
-             "S": {"native": 0, "repaint_in": 0, "gone": 0}}
+        gidx = {d: k for k, d in enumerate(cal)}  # 信号日期 -> 全局 index（算年龄用）
+        final = {"B": set(full["b_dates"]), "S": set(full["s_dates"])}  # 最新数据下的定型信号
+        p = {"B": _new_side(), "S": _new_side()}
+        native_dates = {"B": [], "S": []}         # 本区间内原生出现的信号日期（判最终存活）
         prev = {"B": set(), "S": set()}
         seen = {"B": set(), "S": set()}           # 曾经出现过的信号日期（判 native vs repaint-in）
         for i in range(rt_min_bars - 1, n):
@@ -217,14 +233,28 @@ def events_in_window(start_str, end_str, rt_min_bars=60):
                     for d in appeared:
                         if d not in seen[side] and d == det:
                             p[side]["native"] += 1      # 首见且就在自身K线当天 → 原生
+                            native_dates[side].append(d)
                         else:
                             p[side]["repaint_in"] += 1   # 补标：延迟画上，或消失后重现
-                    p[side]["gone"] += len(gone)
+                    for d in gone:
+                        p[side]["gone"] += 1
+                        j = gidx.get(d)
+                        if j is not None:
+                            p[side]["gone_age"][_age_bucket(i - j)] += 1
                 seen[side] |= appeared
                 prev[side] = cs
+        # 原生信号是否活到最新（现在图上还在不在）
         for side in ("B", "S"):
-            for k in ("native", "repaint_in", "gone"):
+            for d in native_dates[side]:
+                if d in final[side]:
+                    p[side]["nat_survive"] += 1
+                else:
+                    p[side]["nat_die"] += 1
+        for side in ("B", "S"):
+            for k in ("native", "repaint_in", "gone", "nat_survive", "nat_die"):
                 agg[side][k] += p[side][k]
+            for k in AGE_ORDER:
+                agg[side]["gone_age"][k] += p[side]["gone_age"][k]
         if any(p[s][k] for s in ("B", "S") for k in ("native", "repaint_in", "gone")):
             per[t] = p
     return agg, per, len(data), len(tickers)
@@ -769,9 +799,31 @@ def main():
         tot_rin = agg["B"]["repaint_in"] + agg["S"]["repaint_in"]
         tot_gone = agg["B"]["gone"] + agg["S"]["gone"]
         print(f"{'合计':<10}{tot_native:>10}{tot_rin:>10}{tot_gone:>10}")
+
+        print("\n== 消失事件按「信号消失时的年龄(交易日)」分桶 ==")
+        AGE_ORDER = ["0-1", "2-3", "4-5", "6-10", ">10"]
+        print(f"{'':<10}" + "".join(f"{k+'天':>9}" for k in AGE_ORDER))
+        for side, label in (("B", "B 买点"), ("S", "S 卖点")):
+            ga = agg[side]["gone_age"]
+            print(f"{label:<10}" + "".join(f"{ga[k]:>9}" for k in AGE_ORDER))
+        tot_age = {k: agg["B"]["gone_age"][k] + agg["S"]["gone_age"][k] for k in AGE_ORDER}
+        gsum = sum(tot_age.values()) or 1
+        print(f"{'合计':<10}" + "".join(f"{tot_age[k]:>9}" for k in AGE_ORDER))
+        print(f"{'占比':<10}" + "".join(f"{tot_age[k]/gsum*100:>8.0f}%" for k in AGE_ORDER))
+
+        print("\n== 原生信号最终存活率（现在图上还在不在）==")
+        print(f"{'':<10}{'原生':>8}{'存活':>8}{'消失':>8}{'存活率':>9}")
+        for side, label in (("B", "B 买点"), ("S", "S 卖点")):
+            a = agg[side]
+            nat = a["nat_survive"] + a["nat_die"]
+            rate = a["nat_survive"] / nat * 100 if nat else 0
+            print(f"{label:<10}{nat:>8}{a['nat_survive']:>8}{a['nat_die']:>8}{rate:>8.0f}%")
+
         print("\n注：原生出现=信号在它自身K线成为最新时当场首现(lag=0)；")
         print("    补标出现=当天没出、后来重绘画上的，或消失后又重现的；")
         print("    消失=某步集合里还在、下一步没了(repaint-out)；均按「检测日」落在区间内计数。")
+        print("    消失年龄=信号从自身K线到被抹掉时经过的交易日；年龄越小=刚冒头就闪掉(可靠性最差)。")
+        print("    存活率=区间内原生出现的信号里，到最新数据仍留在图上的比例。")
         print("EVENTS_JSON_BEGIN")
         print(json.dumps({"start": start, "end": end, "agg": agg, "per": per,
                           "ok": ok, "tot": tot}, ensure_ascii=False, separators=(",", ":")))
