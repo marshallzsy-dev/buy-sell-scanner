@@ -161,6 +161,75 @@ def repaint_in_analysis(rt_min_bars=60):
     return res, len(data), len(tickers)
 
 
+def events_in_window(start_str, end_str, rt_min_bars=60):
+    """walk-forward 逐根截断重算信号集，统计「检测日」落在 [start,end] 区间内的：
+      - 原生出现(native, lag=0)：信号在它自身那根K线成为最新时当场出现（首次可见）。
+      - 补标出现(repaint-in, lag>=1)：该K线当天没出、过几天才被重绘画上。
+      - 消失(repaint-out)：上一根为最新时集合里还有、这一根为最新时没了。
+    「检测日」= 该 walk 步的最新K线日期（=实盘那天扫描器会观察到该事件的日子）。
+    区间外的启动期事件被自然滤掉（2y 历史下 walk 起点远早于 start）。
+    返回 (agg, per_ticker, ok, tot)。"""
+    import datetime as _dt
+    start = _dt.date.fromisoformat(start_str)
+    end = _dt.date.fromisoformat(end_str)
+
+    tickers = scan.load_universe()
+    data = scan.fetch_all(tickers)
+
+    def _in(dstr):
+        try:
+            d = _dt.date.fromisoformat(dstr)
+        except Exception:
+            return False
+        return start <= d <= end
+
+    agg = {"B": {"native": 0, "repaint_in": 0, "gone": 0},
+           "S": {"native": 0, "repaint_in": 0, "gone": 0}}
+    per = {}   # ticker -> 同结构
+    for t, df in data.items():
+        n = len(df)
+        if n < rt_min_bars + 2:
+            continue
+        try:
+            full = scan.compute_signals(df)
+        except Exception:
+            continue
+        if not full["dates"] or len(full["dates"]) != n:
+            continue
+        cal = full["dates"]                       # 交易日日历（=最新K线日期序列）
+        p = {"B": {"native": 0, "repaint_in": 0, "gone": 0},
+             "S": {"native": 0, "repaint_in": 0, "gone": 0}}
+        prev = {"B": set(), "S": set()}
+        seen = {"B": set(), "S": set()}           # 曾经出现过的信号日期（判 native vs repaint-in）
+        for i in range(rt_min_bars - 1, n):
+            det = cal[i]                          # 本步检测日（最新K线日期）
+            try:
+                cur = scan.compute_signals(df.iloc[:i + 1])
+            except Exception:
+                continue
+            cur_sets = {"B": set(cur["b_dates"]), "S": set(cur["s_dates"])}
+            in_win = _in(det)
+            for side in ("B", "S"):
+                cs = cur_sets[side]
+                appeared = cs - prev[side]
+                gone = prev[side] - cs
+                if in_win:
+                    for d in appeared:
+                        if d not in seen[side] and d == det:
+                            p[side]["native"] += 1      # 首见且就在自身K线当天 → 原生
+                        else:
+                            p[side]["repaint_in"] += 1   # 补标：延迟画上，或消失后重现
+                    p[side]["gone"] += len(gone)
+                seen[side] |= appeared
+                prev[side] = cs
+        for side in ("B", "S"):
+            for k in ("native", "repaint_in", "gone"):
+                agg[side][k] += p[side][k]
+        if any(p[s][k] for s in ("B", "S") for k in ("native", "repaint_in", "gone")):
+            per[t] = p
+    return agg, per, len(data), len(tickers)
+
+
 def _argval(flag):
     """从命令行取 --flag 后紧跟的数值，取不到或非数值返回 None。"""
     if flag in sys.argv:
@@ -681,6 +750,32 @@ def main():
                   f"1天={b['1天']} 2-3天={b['2-3天']} 4-5天={b['4-5天']} >5天={b['>5天']}")
         print("\n注：lag=首次被画上信号时的最新K线，距该信号自身K线的交易日数；")
         print("    lag=0 当天就出（实时可见）；lag>=1 即当天没出、后来重绘补标。")
+        return
+
+    if "--events" in sys.argv:
+        import datetime as _dt
+        rest = [a for a in sys.argv[sys.argv.index("--events") + 1:] if not a.startswith("-")]
+        start = rest[0] if len(rest) >= 1 else "2026-08-01"
+        end = rest[1] if len(rest) >= 2 else _dt.date.today().isoformat()
+        agg, per, ok, tot = events_in_window(start, end)
+        print(f"\n== B/S 事件统计 · 检测日区间 [{start} ~ {end}] ==")
+        print(f"数据覆盖：{ok}/{tot} 只  （walk-forward 逐日重算，口径=实盘扫描器逐日会观察到的事件）\n")
+        hdr = f"{'':<10}{'原生出现':>10}{'补标出现':>10}{'消失':>10}"
+        print(hdr)
+        for side, label in (("B", "B 买点"), ("S", "S 卖点")):
+            a = agg[side]
+            print(f"{label:<10}{a['native']:>10}{a['repaint_in']:>10}{a['gone']:>10}")
+        tot_native = agg["B"]["native"] + agg["S"]["native"]
+        tot_rin = agg["B"]["repaint_in"] + agg["S"]["repaint_in"]
+        tot_gone = agg["B"]["gone"] + agg["S"]["gone"]
+        print(f"{'合计':<10}{tot_native:>10}{tot_rin:>10}{tot_gone:>10}")
+        print("\n注：原生出现=信号在它自身K线成为最新时当场首现(lag=0)；")
+        print("    补标出现=当天没出、后来重绘画上的，或消失后又重现的；")
+        print("    消失=某步集合里还在、下一步没了(repaint-out)；均按「检测日」落在区间内计数。")
+        print("EVENTS_JSON_BEGIN")
+        print(json.dumps({"start": start, "end": end, "agg": agg, "per": per,
+                          "ok": ok, "tot": tot}, ensure_ascii=False, separators=(",", ":")))
+        print("EVENTS_JSON_END")
         return
 
     buckets, dates = compute_from_history()
