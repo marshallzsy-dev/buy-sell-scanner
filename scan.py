@@ -51,7 +51,8 @@ CHART_BARS = 250         # 弹层图表保留的最近 K 线根数（约 1 年�
 STATS_HOLD = 5           # 前向持有交易日数（“B 后 5 日”）
 STATS_MIN_BARS = 60      # walk-forward 评估起点（与 analyze.py 口径一致）
 STATS_WIN = 504          # 滚动重算窗口（约 2 年，与 HISTORY_PERIOD 一致）
-STATS_MAX_TICKERS = 150  # 单次最多为多少只上榜股算画像（防 CI 超时的兜底上限）
+STATS_MAX_TICKERS = 150  # 单次最多「新算」多少只画像（防 CI 超时）；已缓存的不占额度
+PROFILE_TTL_DAYS = 10    # 画像缓存有效期（天）：超过则择机重算，画像是长期统计变化慢
 
 
 # ---------------------------------------------------------------------------
@@ -1272,9 +1273,12 @@ def main():
         if t not in chart_data and t in computed and t in data:
             chart_data[t] = build_chart_data(data[t], computed[t])
 
-    # 上榜股票的历史画像（walk-forward 逐根重算，成本较高）：
-    #   B 榜 → B 画像（均收益/胜率/均回撤/消失率）；S 榜 → S 画像（均回撤/下跌概率/消失率）。
-    # 共用 STATS_MAX_TICKERS 预算兜底防 CI 超时（每只每侧一次 walk）。
+    # 上榜股票的历史画像（walk-forward 逐根重算，很耗时）：B榜→B画像、S榜→S画像。
+    # 画像是 ~2 年历史统计、变化很慢，故缓存进 state["profiles"]，每天只增量补算
+    # 「没算过的 + 已过期的」，单次「新算」上限 STATS_MAX_TICKERS 防 CI 超时；
+    # 几天内全池覆盖后一直保持完整（B/S 都兼顾，不再互相挤占）。
+    from itertools import zip_longest
+
     def _dedup(seq):
         s, out = set(), []
         for t in seq:
@@ -1283,37 +1287,74 @@ def main():
         return out
     b_tickers = _dedup(x["ticker"] for x in b_list)
     s_tickers = _dedup(x["ticker"] for x in s_list)
+
+    prof = state.get("profiles", {})    # {t: {"B":stat|None, "S":stat|None, "asof":"YYYY-MM-DD"}}
+
+    def _fresh(t):
+        e = prof.get(t)
+        try:
+            return e and (today - dt.date.fromisoformat(e.get("asof", ""))).days < PROFILE_TTL_DAYS
+        except Exception:
+            return False
+
+    def _interleave(pairs):     # B/S 交替，保证两侧公平覆盖
+        bs = [p for p in pairs if p[0] == "B"]
+        ss = [p for p in pairs if p[0] == "S"]
+        out = []
+        for b, s in zip_longest(bs, ss):
+            if b:
+                out.append(b)
+            if s:
+                out.append(s)
+        return out
+
+    want = [("B", t) for t in b_tickers] + [("S", t) for t in s_tickers]
+    missing, staleq = [], []
+    for side, t in want:
+        e = prof.get(t)
+        if not (e and side in e):
+            missing.append((side, t))       # 该侧从没算过
+        elif not _fresh(t):
+            staleq.append((side, t))         # 算过但过期
+    todo = _interleave(missing) + _interleave(staleq)   # 缺失优先，过期其次
+
     budget = STATS_MAX_TICKERS
-    if len(b_tickers) + len(s_tickers) > budget:
-        print(f"⚠ 上榜 B{len(b_tickers)}/S{len(s_tickers)} 只，画像计算超预算 {budget}，"
-              f"B/S 交替消耗、达上限即止（两侧公平覆盖）。", flush=True)
-    bstats, sstats = {}, {}
-    print(f"计算上榜股画像：B {len(b_tickers)} 只 / S {len(s_tickers)} 只 ...", flush=True)
-    # B/S 交替入队，避免一侧（尤其扩池后 B 很多）吃光预算导致另一侧画像全空。
-    from itertools import zip_longest
-    queue = []
-    for b, s in zip_longest(b_tickers, s_tickers):
-        if b is not None:
-            queue.append(("B", b))
-        if s is not None:
-            queue.append(("S", s))
-    for side, t in queue:
+    done = 0
+    print(f"上榜 B{len(b_tickers)}/S{len(s_tickers)}；画像待补 缺失{len(missing)}+过期{len(staleq)}，"
+          f"本次新算上限 {budget}（其余用缓存）...", flush=True)
+    for side, t in todo:
         if budget <= 0:
             break
         if t not in data or t not in computed:
             continue
         budget -= 1
+        done += 1
         try:
-            if side == "B":
-                st = b_symbol_stats(data[t], computed[t]["b_dates"])
-                if st:
-                    bstats[t] = st
-            else:
-                st = s_symbol_stats(data[t], computed[t]["s_dates"])
-                if st:
-                    sstats[t] = st
+            st = (b_symbol_stats(data[t], computed[t]["b_dates"]) if side == "B"
+                  else s_symbol_stats(data[t], computed[t]["s_dates"]))
         except Exception as e:
             print(f"  {t} {side}画像计算失败: {e}", flush=True)
+            st = None
+        e = prof.setdefault(t, {})
+        e[side] = st
+        e["asof"] = today_str
+    print(f"  本次实算 {done} 个画像，缓存共 {len(prof)} 只。", flush=True)
+
+    # 渲染用画像从缓存取（本次新算 + 往日缓存），只取上榜且有值的
+    bstats = {t: prof[t]["B"] for t in b_tickers if prof.get(t) and prof[t].get("B")}
+    sstats = {t: prof[t]["S"] for t in s_tickers if prof.get(t) and prof[t].get("S")}
+
+    # 缓存瘦身：丢弃「已不再上榜且很久没碰」的条目，防 state.json 无限膨胀
+    onboard = set(b_tickers) | set(s_tickers)
+    cutoff = PROFILE_TTL_DAYS * 3
+    for t in list(prof.keys()):
+        if t in onboard:
+            continue
+        try:
+            if (today - dt.date.fromisoformat(prof[t].get("asof", ""))).days > cutoff:
+                del prof[t]
+        except Exception:
+            del prof[t]
 
     # 重绘率统计：把「昨日→今日」这一步的信号存活情况累积进 state（云端逐日累积，供 dashboard 展示）。
     # 用 prev_run < today 作闸：同一天重复跑（如手动 dispatch 多次）不会重复计入。
@@ -1347,6 +1388,7 @@ def main():
     state["tickers"] = new_tickers_state
     state["warnings"] = warnings
     state["repaint_stats"] = rstats
+    state["profiles"] = prof
     save_state(state)
 
     # 邮件正文 + 主题（供 CI 发信；本地跑也会生成，无害）
