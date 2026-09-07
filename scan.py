@@ -353,6 +353,8 @@ def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
       - fwd_avg : realtime B「次日开盘入场→持有 hold 交易日→末日收盘平仓」的平均收益率(%)
       - dd_avg  : 上述持有期内「每日相对入场价回撤(仅计跌破入场价部分)」的平均值(%，≤0)
       - dis_rate: realtime 原生出现的 B 信号里，最终在定型(重绘后)信号中消失的比例(%)
+    收益/回撤仅统计「熬过至少一天」的 B（bar i 出现、次日 i+1 重算仍在图上）；
+    一日闪现(次日即消失)的 B 实盘抓不住，从收益/回撤剔除（但仍计入 dis_rate 消失率）。
     realtime 判定 / 入场出场口径与 analyze.py 的 forward_all 完全一致（剥掉重绘 lookahead）。
     只对上榜股票调用（成本 O(bars) 每根重算 × 有信号的股票），返回 dict 或 None（历史不足）。"""
     opens = [float(x) for x in df["Open"].tolist()]
@@ -366,6 +368,7 @@ def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
     final_set = set(final_b_dates)
     native = []          # [(bar_index, date_str)] realtime B 首次以最新K线当场出现的点
     seen = set()
+    step_b = [None] * n  # 每根K线为最新时的 realtime B 集合，用于「次日是否仍在」的存活判定
     for i in range(min_bars - 1, n):
         lo = max(0, i + 1 - win)
         try:
@@ -374,7 +377,8 @@ def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
             continue
         if not cur["dates"]:
             continue
-        if cur["dates"][-1] in set(cur["b_dates"]):   # 最新那根当场就是 B → 实时可见
+        step_b[i] = set(cur["b_dates"])
+        if cur["dates"][-1] in step_b[i]:             # 最新那根当场就是 B → 实时可见
             d = dates[i]
             if d not in seen:
                 seen.add(d)
@@ -382,12 +386,17 @@ def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
     if not native:
         return None
 
-    fwd, dd = [], []
+    # 收益/回撤只统计「熬过至少一天」的 B：bar i 出现、bar i+1 重算仍在图上。
+    # 一日闪现（次日即消失）的 B 实盘根本抓不住，剔除以免拉低画像。
+    fwd, dd, flash = [], [], 0
     for i, d in native:
+        if not (i + 1 < n and step_b[i + 1] is not None and d in step_b[i + 1]):
+            flash += 1
+            continue                                  # 一日闪现，剔除出收益/回撤
         eo = opens[i + 1] if i + 1 < n else 0.0
         if i + hold < n and eo:
             fwd.append((closes[i + hold] - eo) / eo * 100)
-            # 持有 hold 日内「每日相对入场价的回撤」（仅计跌破入场价的部分，≤0），再取均值——
+            # 持有 hold 日内「每日相对入场价的回撤」（仅计跌破入场价部分，≤0），再取均值——
             # 反映典型回撤水平，而非最坏单点。
             daily_dd = [min(0.0, (lw - eo) / eo) for lw in lows[i + 1:i + hold + 1]]
             dd.append(sum(daily_dd) / len(daily_dd) * 100)
@@ -400,6 +409,7 @@ def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
         "dis_rate": (gone / total * 100) if total else None,
         "dis_gone": gone,
         "dis_total": total,
+        "flash": flash,          # 一日闪现、已从收益/回撤剔除的 B 数
     }
 
 
@@ -413,7 +423,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
         v = st["fwd_avg"]
         color = "#5fd98a" if v > 0 else ("#f07fce" if v < 0 else "var(--muted)")
         return (f'<td class="num" style="color:{color}" '
-                f'title="{st["fwd_n"]} 个实时B样本">{v:+.1f}%</td>')
+                f'title="{st["fwd_n"]} 个存活B样本（已剔除 {st.get("flash", 0)} 个一日闪现）">{v:+.1f}%</td>')
 
     def _dd_cell(st):
         if not st or st.get("dd_avg") is None:
@@ -619,7 +629,8 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
     · 点击代码弹出该股 K 线图，B/S 买卖点已标在图上（可缩放、拖动）；无图表数据的代码则跳 TradingView。<br>
     · <b>B后5日均收益 / B后5日均回撤 / B消失率</b>：均为该股<b>历史</b>画像（非本次信号预测），基于 walk-forward 逐根重算的
       <b>实时(realtime)B 信号</b>（剥掉重绘 lookahead）。收益=次日开盘入场、持有 5 交易日、末日收盘平仓的平均值；
-      均回撤=持有 5 日内每日相对入场价回撤（仅计跌破入场价的部分）的平均值；消失率=实时出现过的 B 里最终被重绘抹掉的比例（越低越可信）。
+      均回撤=持有 5 日内每日相对入场价回撤（仅计跌破入场价的部分）的平均值；<b>收益/回撤已剔除「次日即消失」的一日闪现 B</b>（实盘抓不住）；
+      消失率=实时出现过的 B 里最终被重绘抹掉的比例（越低越可信，仍含一日闪现）。
       单只样本量有限、未扣手续费，仅供横向参考。<br>
     · 本工具复刻 “S1 Formula v34” 指标，<b>该算法会重绘</b>：历史 K 线上的买卖点会随新数据变动/消失，Warning 区即用于追踪这一现象。<br>
     · 抓取失败/跳过的代码：{skipped_txt}
