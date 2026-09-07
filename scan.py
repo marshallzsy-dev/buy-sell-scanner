@@ -351,7 +351,7 @@ def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
                    min_bars=STATS_MIN_BARS, win=STATS_WIN):
     """单只股票的 B 信号历史画像，walk-forward 逐根重算 realtime B 信号后计算：
       - fwd_avg : realtime B「次日开盘入场→持有 hold 交易日→末日收盘平仓」的平均收益率(%)
-      - mdd_avg : 上述持有期内相对入场价的平均最大回撤(%，负数=最深跌幅)
+      - dd_avg  : 上述持有期内「每日相对入场价回撤(仅计跌破入场价部分)」的平均值(%，≤0)
       - dis_rate: realtime 原生出现的 B 信号里，最终在定型(重绘后)信号中消失的比例(%)
     realtime 判定 / 入场出场口径与 analyze.py 的 forward_all 完全一致（剥掉重绘 lookahead）。
     只对上榜股票调用（成本 O(bars) 每根重算 × 有信号的股票），返回 dict 或 None（历史不足）。"""
@@ -382,19 +382,21 @@ def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
     if not native:
         return None
 
-    fwd, mdd = [], []
+    fwd, dd = [], []
     for i, d in native:
         eo = opens[i + 1] if i + 1 < n else 0.0
         if i + hold < n and eo:
             fwd.append((closes[i + hold] - eo) / eo * 100)
-            low_win = min(lows[i + 1:i + hold + 1])   # 持有期内最低价
-            mdd.append((low_win - eo) / eo * 100)     # 相对入场价的最深跌幅（负数）
+            # 持有 hold 日内「每日相对入场价的回撤」（仅计跌破入场价的部分，≤0），再取均值——
+            # 反映典型回撤水平，而非最坏单点。
+            daily_dd = [min(0.0, (lw - eo) / eo) for lw in lows[i + 1:i + hold + 1]]
+            dd.append(sum(daily_dd) / len(daily_dd) * 100)
     total = len(native)
     gone = sum(1 for _, d in native if d not in final_set)
     return {
         "fwd_avg": (sum(fwd) / len(fwd)) if fwd else None,
         "fwd_n": len(fwd),
-        "mdd_avg": (sum(mdd) / len(mdd)) if mdd else None,
+        "dd_avg": (sum(dd) / len(dd)) if dd else None,
         "dis_rate": (gone / total * 100) if total else None,
         "dis_gone": gone,
         "dis_total": total,
@@ -413,11 +415,12 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
         return (f'<td class="num" style="color:{color}" '
                 f'title="{st["fwd_n"]} 个实时B样本">{v:+.1f}%</td>')
 
-    def _mdd_cell(st):
-        if not st or st.get("mdd_avg") is None:
+    def _dd_cell(st):
+        if not st or st.get("dd_avg") is None:
             return '<td class="num" style="color:var(--muted)">—</td>'
         return (f'<td class="num" style="color:var(--amber)" '
-                f'title="持有5日相对入场价的平均最深跌幅">{st["mdd_avg"]:.1f}%</td>')
+                f'title="持有5日内每日相对入场价回撤的平均值（仅计跌破入场价的部分）">'
+                f'{st["dd_avg"]:.1f}%</td>')
 
     def _dis_cell(st):
         if not st or st.get("dis_rate") is None:
@@ -439,7 +442,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
             f'<td>{item["last_date"]}</td>'
             f'<td><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
             f'<td class="num">{item["price"]:.2f}</td>'
-            f'{_fwd_cell(st)}{_mdd_cell(st)}{_dis_cell(st)}'
+            f'{_fwd_cell(st)}{_dd_cell(st)}{_dis_cell(st)}'
             f'</tr>'
         )
 
@@ -575,7 +578,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
     <table>
       <thead><tr><th>代码</th><th>最近B日期</th><th>时点</th><th>现价</th>
         <th class="num" title="历史实时B信号：次日开盘入场、持有5交易日、末日收盘平仓的平均收益">B后5日均收益</th>
-        <th class="num" title="历史实时B信号：持有5日内相对入场价的平均最深跌幅">B后5日回撤</th>
+        <th class="num" title="历史实时B信号：持有5日内每日相对入场价回撤的平均值（仅计跌破入场价的部分）">B后5日均回撤</th>
         <th class="num" title="历史实时B信号中，最终被重绘抹掉（消失）的比例">B消失率</th></tr></thead>
       <tbody>{b_rows}</tbody>
     </table>
@@ -586,7 +589,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
     <table>
       <thead><tr><th>代码</th><th>最近S日期</th><th>时点</th><th>现价</th>
         <th class="num" title="该股历史实时B信号：次日开盘入场、持有5交易日、末日收盘平仓的平均收益">B后5日均收益</th>
-        <th class="num" title="该股历史实时B信号：持有5日内相对入场价的平均最深跌幅">B后5日回撤</th>
+        <th class="num" title="该股历史实时B信号：持有5日内每日相对入场价回撤的平均值（仅计跌破入场价的部分）">B后5日均回撤</th>
         <th class="num" title="该股历史实时B信号中，最终被重绘抹掉（消失）的比例">B消失率</th></tr></thead>
       <tbody>{s_rows}</tbody>
     </table>
@@ -614,9 +617,9 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
 
   <footer>
     · 点击代码弹出该股 K 线图，B/S 买卖点已标在图上（可缩放、拖动）；无图表数据的代码则跳 TradingView。<br>
-    · <b>B后5日均收益 / B后5日回撤 / B消失率</b>：均为该股<b>历史</b>画像（非本次信号预测），基于 walk-forward 逐根重算的
+    · <b>B后5日均收益 / B后5日均回撤 / B消失率</b>：均为该股<b>历史</b>画像（非本次信号预测），基于 walk-forward 逐根重算的
       <b>实时(realtime)B 信号</b>（剥掉重绘 lookahead）。收益=次日开盘入场、持有 5 交易日、末日收盘平仓的平均值；
-      回撤=持有期内相对入场价的平均最深跌幅；消失率=实时出现过的 B 里最终被重绘抹掉的比例（越低越可信）。
+      均回撤=持有 5 日内每日相对入场价回撤（仅计跌破入场价的部分）的平均值；消失率=实时出现过的 B 里最终被重绘抹掉的比例（越低越可信）。
       单只样本量有限、未扣手续费，仅供横向参考。<br>
     · 本工具复刻 “S1 Formula v34” 指标，<b>该算法会重绘</b>：历史 K 线上的买卖点会随新数据变动/消失，Warning 区即用于追踪这一现象。<br>
     · 抓取失败/跳过的代码：{skipped_txt}
@@ -714,18 +717,18 @@ def render_email(b_list, s_list, warnings, meta, bstats):
             m = _num_td("—", "#9aa3b2")
             return m + m + m
         fwd = st.get("fwd_avg")
-        mdd = st.get("mdd_avg")
+        dd = st.get("dd_avg")
         dis = st.get("dis_rate")
         fwd_td = (_num_td(f"{fwd:+.1f}%", "#1a8f45" if fwd > 0 else "#b8348a")
                   if fwd is not None else _num_td("—", "#9aa3b2"))
-        mdd_td = (_num_td(f"{mdd:.1f}%", "#d97706") if mdd is not None
-                  else _num_td("—", "#9aa3b2"))
+        dd_td = (_num_td(f"{dd:.1f}%", "#d97706") if dd is not None
+                 else _num_td("—", "#9aa3b2"))
         if dis is None:
             dis_td = _num_td("—", "#9aa3b2")
         else:
             dc = "#1a8f45" if dis < 20 else ("#d97706" if dis < 50 else "#b8348a")
             dis_td = _num_td(f"{dis:.0f}%", dc)
-        return fwd_td + mdd_td + dis_td
+        return fwd_td + dd_td + dis_td
 
     def bs_rows(items, empty_txt):
         if not items:
@@ -789,10 +792,10 @@ def render_email(b_list, s_list, warnings, meta, bstats):
       </td></tr>"""
 
     b_sec = section("B 买点 · 当日/近三日", "#2fb35a", len(b_list),
-                    ["代码", "最近B日期", "时点", "现价", "B后5日均收益", "B后5日回撤", "B消失率"],
+                    ["代码", "最近B日期", "时点", "现价", "B后5日均收益", "B后5日均回撤", "B消失率"],
                     bs_rows(b_list, "近三日无 B 买点"))
     s_sec = section("S 卖点 · 当日/近三日", "#d63c9c", len(s_list),
-                    ["代码", "最近S日期", "时点", "现价", "B后5日均收益", "B后5日回撤", "B消失率"],
+                    ["代码", "最近S日期", "时点", "现价", "B后5日均收益", "B后5日均回撤", "B消失率"],
                     bs_rows(s_list, "近三日无 S 卖点"))
     w_sec = section("⚠ 近期消失的买卖点", "#f0a020", len(warnings),
                     ["代码", "类型", "消失节点", "检测于"],
