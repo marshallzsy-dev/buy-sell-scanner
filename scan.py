@@ -415,7 +415,69 @@ def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
     }
 
 
-def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
+def s_symbol_stats(df, final_s_dates, hold=STATS_HOLD,
+                   min_bars=STATS_MIN_BARS, win=STATS_WIN):
+    """单只股票的 S 卖点历史画像（把 S 当作见顶/回落信号），walk-forward 逐根重算：
+      - dd_avg   : S 出现后「次日开盘为基准，持有 hold 交易日内每日相对基准的回撤
+                   (仅计跌破基准部分，≤0)」的平均值(%)——S 后股价平均能回撤多深。
+      - down_rate: S 出现后持有 hold 交易日、末日收盘 < 次日开盘的比例(%)——即「下跌概率/反向胜率」。
+      - dis_rate : realtime 原生出现的 S 信号里，最终在定型(重绘后)信号中消失的比例(%)。
+    回撤/下跌概率仅统计「熬过至少一天」的 S（bar i 出现、次日 i+1 重算仍在图上）；
+    一日闪现(次日即消失)的 S 实盘抓不住，剔除（但仍计入 dis_rate 消失率）。口径与 B 画像镜像一致。"""
+    opens = [float(x) for x in df["Open"].tolist()]
+    lows = [float(x) for x in df["Low"].tolist()]
+    closes = [float(x) for x in df["Close"].tolist()]
+    dates = [d.strftime("%Y-%m-%d") for d in df.index]
+    n = len(closes)
+    if n < min_bars + 2:
+        return None
+
+    final_set = set(final_s_dates)
+    native = []          # [(bar_index, date_str)] realtime S 首次以最新K线当场出现的点
+    seen = set()
+    step_s = [None] * n  # 每根K线为最新时的 realtime S 集合，用于「次日是否仍在」的存活判定
+    for i in range(min_bars - 1, n):
+        lo = max(0, i + 1 - win)
+        try:
+            cur = compute_signals(df.iloc[lo:i + 1])
+        except Exception:
+            continue
+        if not cur["dates"]:
+            continue
+        step_s[i] = set(cur["s_dates"])
+        if cur["dates"][-1] in step_s[i]:             # 最新那根当场就是 S → 实时可见
+            d = dates[i]
+            if d not in seen:
+                seen.add(d)
+                native.append((i, d))
+    if not native:
+        return None
+
+    dd, down, flash = [], [], 0
+    for i, d in native:
+        if not (i + 1 < n and step_s[i + 1] is not None and d in step_s[i + 1]):
+            flash += 1
+            continue                                  # 一日闪现，剔除出回撤/下跌概率
+        eo = opens[i + 1] if i + 1 < n else 0.0
+        if i + hold < n and eo:
+            # 持有 hold 日内「每日相对次日开盘的回撤」（仅计跌破部分，≤0）取均值——S 后典型回撤深度。
+            daily_dd = [min(0.0, (lw - eo) / eo) for lw in lows[i + 1:i + hold + 1]]
+            dd.append(sum(daily_dd) / len(daily_dd) * 100)
+            down.append(1 if closes[i + hold] < eo else 0)   # 末日收盘 < 基准 → 下跌
+    total = len(native)
+    gone = sum(1 for _, d in native if d not in final_set)
+    return {
+        "dd_avg": (sum(dd) / len(dd)) if dd else None,
+        "down_rate": (sum(down) / len(down) * 100) if down else None,
+        "n": len(dd),
+        "dis_rate": (gone / total * 100) if total else None,
+        "dis_gone": gone,
+        "dis_total": total,
+        "flash": flash,
+    }
+
+
+def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
     et = meta["run_et"]
     stamp = et.strftime("%Y-%m-%d %H:%M")
 
@@ -443,13 +505,30 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
                 f'title="持有5日内每日相对入场价回撤的平均值（仅计跌破入场价的部分）">'
                 f'{st["dd_avg"]:.1f}%</td>')
 
-    def _dis_cell(st):
+    def _dis_cell(st, side="B"):
         if not st or st.get("dis_rate") is None:
             return '<td class="num" style="color:var(--muted)">—</td>'
         r = st["dis_rate"]
         color = "#5fd98a" if r < 20 else ("#f0a020" if r < 50 else "#f07fce")
         return (f'<td class="num" style="color:{color}" '
-                f'title="{st["dis_gone"]}/{st["dis_total"]} 个原生B最终被重绘抹掉">{r:.0f}%</td>')
+                f'title="{st["dis_gone"]}/{st["dis_total"]} 个原生{side}最终被重绘抹掉">{r:.0f}%</td>')
+
+    # —— S 卖点画像单元格（S 当见顶/回落信号看：回撤越深、下跌概率越高越有效）——
+    def _sdd_cell(st):
+        if not st or st.get("dd_avg") is None:
+            return '<td class="num" style="color:var(--muted)">—</td>'
+        return (f'<td class="num" style="color:var(--amber)" '
+                f'title="剔除一日闪现S后，{st["n"]} 个存活S：次日开盘为基准、持有5日内每日回撤（仅计跌破部分）的平均值">'
+                f'{st["dd_avg"]:.1f}%</td>')
+
+    def _sdown_cell(st):
+        if not st or st.get("down_rate") is None:
+            return '<td class="num" style="color:var(--muted)">—</td>'
+        r = st["down_rate"]
+        color = "#5fd98a" if r >= 55 else ("#f0a020" if r >= 45 else "#f07fce")
+        return (f'<td class="num" style="color:{color}" '
+                f'title="剔除一日闪现S后，{st["n"]} 个存活S里持有5日末收低于次日开盘的比例（反向胜率）">'
+                f'{r:.0f}%</td>')
 
     def row_bs(item):
         code = item["ticker"]
@@ -463,7 +542,23 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
             f'<td>{item["last_date"]}</td>'
             f'<td><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
             f'<td class="num">{item["price"]:.2f}</td>'
-            f'{_fwd_cell(st)}{_win_cell(st)}{_dd_cell(st)}{_dis_cell(st)}'
+            f'{_fwd_cell(st)}{_win_cell(st)}{_dd_cell(st)}{_dis_cell(st, "B")}'
+            f'</tr>'
+        )
+
+    def row_s(item):
+        code = item["ticker"]
+        st = sstats.get(code)
+        has = code in chart_data
+        cell = (f'<a class="chart-link" data-sym="{code}">{code}</a>' if has
+                else f'<a href="{tv_url(code)}" target="_blank" rel="noopener">{code}</a>')
+        return (
+            f'<tr>'
+            f'<td class="code">{cell}</td>'
+            f'<td>{item["last_date"]}</td>'
+            f'<td><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
+            f'<td class="num">{item["price"]:.2f}</td>'
+            f'{_sdd_cell(st)}{_sdown_cell(st)}{_dis_cell(st, "S")}'
             f'</tr>'
         )
 
@@ -483,8 +578,8 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
             f'</tr>'
         )
 
-    b_rows = "\n".join(row_bs(x) for x in b_list) or '<tr><td colspan="7" class="empty">近三日无 B 买点</td></tr>'
-    s_rows = "\n".join(row_bs(x) for x in s_list) or '<tr><td colspan="7" class="empty">近三日无 S 卖点</td></tr>'
+    b_rows = "\n".join(row_bs(x) for x in b_list) or '<tr><td colspan="8" class="empty">近三日无 B 买点</td></tr>'
+    s_rows = "\n".join(row_s(x) for x in s_list) or '<tr><td colspan="7" class="empty">近三日无 S 卖点</td></tr>'
     warn_rows = "\n".join(row_warn(w) for w in warnings) or \
         '<tr><td colspan="4" class="empty">暂无消失记录（需累积历史快照，运行几天后逐步显现）</td></tr>'
 
@@ -610,10 +705,9 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
     <div class="stitle"><span class="dot p"></span> S 卖点 · 当日/近三日 <span class="cnt">（{len(s_list)}）</span></div>
     <table>
       <thead><tr><th>代码</th><th>最近S日期</th><th>时点</th><th>现价</th>
-        <th class="num" title="该股历史实时B信号：次日开盘入场、持有5交易日、末日收盘平仓的平均收益">B后5日均收益</th>
-        <th class="num" title="剔除一日闪现B后，持有5交易日末收为正的比例">B后5日胜率</th>
-        <th class="num" title="该股历史实时B信号：持有5日内每日相对入场价回撤的平均值（仅计跌破入场价的部分）">B后5日均回撤</th>
-        <th class="num" title="该股历史实时B信号中，最终被重绘抹掉（消失）的比例">B消失率</th></tr></thead>
+        <th class="num" title="剔除一日闪现S后：S次日开盘为基准、持有5日内每日回撤（仅计跌破部分）的平均值，越深说明S后越易回落">S后5日均回撤</th>
+        <th class="num" title="剔除一日闪现S后：持有5日末收低于次日开盘的比例（反向胜率），越高说明S越可靠">S后5日下跌概率</th>
+        <th class="num" title="该股历史实时S信号中，最终被重绘抹掉（消失）的比例">S消失率</th></tr></thead>
       <tbody>{s_rows}</tbody>
     </table>
   </section>
@@ -644,7 +738,11 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
       <b>实时(realtime)B 信号</b>（剥掉重绘 lookahead）。收益=次日开盘入场、持有 5 交易日、末日收盘平仓的平均值；
       均回撤=持有 5 日内每日相对入场价回撤（仅计跌破入场价的部分）的平均值；胜率=持有 5 日末收为正的比例；
       <b>收益/胜率/回撤均已剔除「次日即消失」的一日闪现 B</b>（实盘抓不住）；
-      消失率=实时出现过的 B 里最终被重绘抹掉的比例（越低越可信，仍含一日闪现）。
+      消失率=实时出现过的 B 里最终被重绘抹掉的比例（越低越可信，仍含一日闪现）。<br>
+    · <b>S后5日均回撤 / S后5日下跌概率 / S消失率</b>：把 S 当见顶/回落信号的<b>历史</b>画像。
+      均回撤=S 次日开盘为基准、持有 5 日内每日回撤（仅计跌破部分）的平均值（越深说明 S 后越易回落）；
+      下跌概率=持有 5 日末收 < 次日开盘的比例（<b>反向胜率</b>，越高 S 越可靠）；两者均已剔除一日闪现 S；
+      S消失率=实时出现过的 S 里最终被重绘抹掉的比例。
       单只样本量有限、未扣手续费，仅供横向参考。<br>
     · 本工具复刻 “S1 Formula v34” 指标，<b>该算法会重绘</b>：历史 K 线上的买卖点会随新数据变动/消失，Warning 区即用于追踪这一现象。<br>
     · 抓取失败/跳过的代码：{skipped_txt}
@@ -958,26 +1056,47 @@ def main():
         if t not in chart_data and t in computed and t in data:
             chart_data[t] = build_chart_data(data[t], computed[t])
 
-    # 上榜股票（近三日 B/S）的 B 信号历史画像：前向收益 / 回撤 / 消失率。
-    # 只对上榜股算（walk-forward 逐根重算成本较高），并设上限兜底防 CI 超时。
-    stat_tickers = [x["ticker"] for x in b_list] + [x["ticker"] for x in s_list]
-    seen_st = set()
-    stat_tickers = [t for t in stat_tickers if not (t in seen_st or seen_st.add(t))]
-    bstats = {}
-    if len(stat_tickers) > STATS_MAX_TICKERS:
-        print(f"⚠ 上榜 {len(stat_tickers)} 只超过画像上限 {STATS_MAX_TICKERS}，"
-              f"仅为前 {STATS_MAX_TICKERS} 只计算 B 画像。", flush=True)
-        stat_tickers = stat_tickers[:STATS_MAX_TICKERS]
-    print(f"计算 {len(stat_tickers)} 只上榜股的 B 信号历史画像 ...", flush=True)
-    for t in stat_tickers:
+    # 上榜股票的历史画像（walk-forward 逐根重算，成本较高）：
+    #   B 榜 → B 画像（均收益/胜率/均回撤/消失率）；S 榜 → S 画像（均回撤/下跌概率/消失率）。
+    # 共用 STATS_MAX_TICKERS 预算兜底防 CI 超时（每只每侧一次 walk）。
+    def _dedup(seq):
+        s, out = set(), []
+        for t in seq:
+            if t not in s:
+                s.add(t); out.append(t)
+        return out
+    b_tickers = _dedup(x["ticker"] for x in b_list)
+    s_tickers = _dedup(x["ticker"] for x in s_list)
+    budget = STATS_MAX_TICKERS
+    if len(b_tickers) + len(s_tickers) > budget:
+        print(f"⚠ 上榜 B{len(b_tickers)}/S{len(s_tickers)} 只，画像计算超预算 {budget}，"
+              f"按 B 优先、达上限即止。", flush=True)
+    bstats, sstats = {}, {}
+    print(f"计算上榜股画像：B {len(b_tickers)} 只 / S {len(s_tickers)} 只 ...", flush=True)
+    for t in b_tickers:
+        if budget <= 0:
+            break
         if t in data and t in computed:
+            budget -= 1
             try:
                 st = b_symbol_stats(data[t], computed[t]["b_dates"])
             except Exception as e:
-                print(f"  {t} 画像计算失败: {e}", flush=True)
+                print(f"  {t} B画像计算失败: {e}", flush=True)
                 st = None
             if st:
                 bstats[t] = st
+    for t in s_tickers:
+        if budget <= 0:
+            break
+        if t in data and t in computed:
+            budget -= 1
+            try:
+                st = s_symbol_stats(data[t], computed[t]["s_dates"])
+            except Exception as e:
+                print(f"  {t} S画像计算失败: {e}", flush=True)
+                st = None
+            if st:
+                sstats[t] = st
 
     # 重绘率统计：把「昨日→今日」这一步的信号存活情况累积进 state（云端逐日累积，供 dashboard 展示）。
     # 用 prev_run < today 作闸：同一天重复跑（如手动 dispatch 多次）不会重复计入。
@@ -1002,7 +1121,7 @@ def main():
         "lwc_lib": load_lwc_lib(),
         "repaint_stats": rstats,
     }
-    html = render_html(b_list, s_list, warnings, meta, chart_data, bstats)
+    html = render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats)
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
 
