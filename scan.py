@@ -714,6 +714,9 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
   .filt {{ font-size:12px; color:var(--muted); cursor:pointer; user-select:none;
     display:inline-flex; align-items:center; gap:5px; font-weight:400; }}
   .filt input {{ accent-color:#58a6ff; }}
+  .more-btn {{ background:#0d1117; border:1px solid var(--line); color:#58a6ff;
+    border-radius:8px; padding:7px 18px; font-size:13px; cursor:pointer; }}
+  .more-btn:hover {{ border-color:#58a6ff; }}
   /* 首屏定位 + 风险声明 */
   .intro {{ background:var(--panel); border:1px solid var(--line); border-left:3px solid #58a6ff;
     border-radius:12px; padding:14px 16px; margin-top:14px; font-size:13px; line-height:1.7; }}
@@ -831,6 +834,9 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
         <th class="num" title="历史实时B信号中，最终被重绘抹掉（消失）的比例">B消失率</th></tr></thead>
       <tbody>{b_rows}</tbody>
     </table>
+    <div style="text-align:center;margin-top:6px;">
+      <button id="b-more" class="more-btn" style="display:none">查看更多</button>
+    </div>
   </section>
 
   <section>
@@ -1002,13 +1008,40 @@ window.__UNIVERSE__ = {uni_json};
       el.classList.toggle('on', on);
     }});
   }}
+  function favSet() {{ var s = {{}}; load().forEach(function(t) {{ s[t] = 1; }}); return s; }}
+  var bExpanded = false;
+  var B_LIMIT = 50;
   function applyFilter() {{
-    document.querySelectorAll('.wl-only').forEach(function(cb) {{
-      var set = {{}}; load().forEach(function(t) {{ set[t] = 1; }});
-      document.querySelectorAll('tr[data-tbl="' + cb.dataset.tbl + '"]').forEach(function(tr) {{
-        if (tr.dataset.sym) tr.style.display = (!cb.checked || set[tr.dataset.sym]) ? '' : 'none';
-      }});
+    // 只处理 S 表；B 表由 applyBView 统一管（50 条上限 + 只看自选）
+    var cb = document.querySelector('.wl-only[data-tbl="s"]');
+    if (!cb) return;
+    var set = favSet();
+    document.querySelectorAll('tr[data-tbl="s"]').forEach(function(tr) {{
+      if (tr.dataset.sym) tr.style.display = (!cb.checked || set[tr.dataset.sym]) ? '' : 'none';
     }});
+  }}
+  function applyBView() {{
+    var cb = document.querySelector('.wl-only[data-tbl="b"]');
+    var favOnly = cb && cb.checked;
+    var set = favSet();
+    var rows = document.querySelectorAll('tr[data-tbl="b"]');
+    var shown = 0;
+    rows.forEach(function(tr) {{
+      var t = tr.dataset.sym; if (!t) return;
+      var visible;
+      if (favOnly) {{ visible = !!set[t]; }}
+      else {{ visible = bExpanded || shown < B_LIMIT; shown++; }}
+      tr.style.display = visible ? '' : 'none';
+    }});
+    var btn = document.getElementById('b-more');
+    if (btn) {{
+      var total = rows.length;
+      if (favOnly || total <= B_LIMIT) {{ btn.style.display = 'none'; }}
+      else {{
+        btn.style.display = '';
+        btn.textContent = bExpanded ? '收起' : ('查看更多（还有 ' + (total - B_LIMIT) + ' 只）');
+      }}
+    }}
   }}
   function refresh() {{
     var l = load();
@@ -1021,6 +1054,7 @@ window.__UNIVERSE__ = {uni_json};
     }}
     syncStars();
     applyFilter();
+    applyBView();
   }}
 
   var dl = document.getElementById('wl-list');
@@ -1031,7 +1065,11 @@ window.__UNIVERSE__ = {uni_json};
   }});
   var inp = document.getElementById('wl-search');
   if (inp) inp.addEventListener('keydown', function(e) {{ if (e.key === 'Enter') {{ add(inp.value); inp.value = ''; }} }});
-  document.querySelectorAll('.wl-only').forEach(function(cb) {{ cb.addEventListener('change', applyFilter); }});
+  document.querySelectorAll('.wl-only').forEach(function(cb) {{
+    cb.addEventListener('change', function() {{ applyFilter(); applyBView(); }});
+  }});
+  var moreBtn = document.getElementById('b-more');
+  if (moreBtn) moreBtn.addEventListener('click', function() {{ bExpanded = !bExpanded; applyBView(); }});
   refresh();
 }})();
 </script>
@@ -1286,9 +1324,7 @@ def main():
     # 上榜股票的历史画像（walk-forward 逐根重算，很耗时）：B榜→B画像、S榜→S画像。
     # 画像是 ~2 年历史统计、变化很慢，故缓存进 state["profiles"]，每天只增量补算
     # 「没算过的 + 已过期的」，单次「新算」上限 STATS_MAX_TICKERS 防 CI 超时；
-    # 几天内全池覆盖后一直保持完整（B/S 都兼顾，不再互相挤占）。
-    from itertools import zip_longest
-
+    # 几天内 B 榜先补满、S 榜随后补齐。
     def _dedup(seq):
         s, out = set(), []
         for t in seq:
@@ -1307,17 +1343,6 @@ def main():
         except Exception:
             return False
 
-    def _interleave(pairs):     # B/S 交替，保证两侧公平覆盖
-        bs = [p for p in pairs if p[0] == "B"]
-        ss = [p for p in pairs if p[0] == "S"]
-        out = []
-        for b, s in zip_longest(bs, ss):
-            if b:
-                out.append(b)
-            if s:
-                out.append(s)
-        return out
-
     want = [("B", t) for t in b_tickers] + [("S", t) for t in s_tickers]
     missing, staleq = [], []
     for side, t in want:
@@ -1326,7 +1351,11 @@ def main():
             missing.append((side, t))       # 该侧从没算过
         elif not _fresh(t):
             staleq.append((side, t))         # 算过但过期
-    todo = _interleave(missing) + _interleave(staleq)   # 缺失优先，过期其次
+    # 优先把 B 榜画像补满（S 靠后续每日缓存累积补齐）：B 缺失 → B 过期 → S 缺失 → S 过期。
+    def _side(pairs, s):
+        return [p for p in pairs if p[0] == s]
+    todo = (_side(missing, "B") + _side(staleq, "B")
+            + _side(missing, "S") + _side(staleq, "S"))
 
     budget = STATS_MAX_TICKERS
     done = 0
