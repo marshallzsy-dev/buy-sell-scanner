@@ -1286,33 +1286,34 @@ def main():
     budget = STATS_MAX_TICKERS
     if len(b_tickers) + len(s_tickers) > budget:
         print(f"⚠ 上榜 B{len(b_tickers)}/S{len(s_tickers)} 只，画像计算超预算 {budget}，"
-              f"按 B 优先、达上限即止。", flush=True)
+              f"B/S 交替消耗、达上限即止（两侧公平覆盖）。", flush=True)
     bstats, sstats = {}, {}
     print(f"计算上榜股画像：B {len(b_tickers)} 只 / S {len(s_tickers)} 只 ...", flush=True)
-    for t in b_tickers:
+    # B/S 交替入队，避免一侧（尤其扩池后 B 很多）吃光预算导致另一侧画像全空。
+    from itertools import zip_longest
+    queue = []
+    for b, s in zip_longest(b_tickers, s_tickers):
+        if b is not None:
+            queue.append(("B", b))
+        if s is not None:
+            queue.append(("S", s))
+    for side, t in queue:
         if budget <= 0:
             break
-        if t in data and t in computed:
-            budget -= 1
-            try:
+        if t not in data or t not in computed:
+            continue
+        budget -= 1
+        try:
+            if side == "B":
                 st = b_symbol_stats(data[t], computed[t]["b_dates"])
-            except Exception as e:
-                print(f"  {t} B画像计算失败: {e}", flush=True)
-                st = None
-            if st:
-                bstats[t] = st
-    for t in s_tickers:
-        if budget <= 0:
-            break
-        if t in data and t in computed:
-            budget -= 1
-            try:
+                if st:
+                    bstats[t] = st
+            else:
                 st = s_symbol_stats(data[t], computed[t]["s_dates"])
-            except Exception as e:
-                print(f"  {t} S画像计算失败: {e}", flush=True)
-                st = None
-            if st:
-                sstats[t] = st
+                if st:
+                    sstats[t] = st
+        except Exception as e:
+            print(f"  {t} {side}画像计算失败: {e}", flush=True)
 
     # 重绘率统计：把「昨日→今日」这一步的信号存活情况累积进 state（云端逐日累积，供 dashboard 展示）。
     # 用 prev_run < today 作闸：同一天重复跑（如手动 dispatch 多次）不会重复计入。
