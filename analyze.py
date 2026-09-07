@@ -118,6 +118,66 @@ def forward_all(hold=5, rt_min_bars=60):
                 ok=len(data), tot=len(tickers))
 
 
+def b_forward_survive(hold=5, min_bars=60):
+    """只看 B 买点：realtime 当天出的原生 B，算「次日开盘入场→持有 hold 交易日」的
+    收益率 + 持仓期最大回撤，并把「出现后第二天就消失」的 B（一日闪现，实盘根本
+    抓不住）剔除，对比过滤前后。
+      收益 ret = (close[i+hold] - open[i+1]) / open[i+1]
+      回撤 mdd = 持仓 [i+1 .. i+hold] 内，价格从入场后运行最高点(用最高价)
+                 到最低价(用最低价)的最大跌幅，正数。
+    存活判定：bar i 为最新时 cal[i] 是 B；到 bar i+1 为最新时重算，cal[i] 仍是 B
+             → 存活(至少熬过一天)；否则=一日闪现，剔除。
+    realtime 信号用滚动 504 交易日窗口重算，与线上扫描器 period=2y 一致。"""
+    tickers = scan.load_universe()
+    data = scan.fetch_all(tickers)
+    WIN = 504
+    all_b, surv_b = [], []     # 每个元素 (ret%, mdd%)
+    flash = 0                  # 一日闪现、被剔除的 B 数
+    for t, df in data.items():
+        n = len(df)
+        if n < min_bars + hold + 2:
+            continue
+        opens = [float(x) for x in df["Open"].tolist()]
+        highs = [float(x) for x in df["High"].tolist()]
+        lows = [float(x) for x in df["Low"].tolist()]
+        closes = [float(x) for x in df["Close"].tolist()]
+        dates = [d.strftime("%Y-%m-%d") for d in df.index]
+        if not (n == len(opens) == len(dates)):
+            continue
+        # 每根 K 线为最新时的 realtime B 集合（滚动窗口重算）
+        step_bset = [set() for _ in range(n)]
+        for i in range(min_bars - 1, n):
+            lo = max(0, i + 1 - WIN)
+            try:
+                cur = scan.compute_signals(df.iloc[lo:i + 1])
+            except Exception:
+                continue
+            step_bset[i] = set(cur.get("b_dates", []))
+        for i in range(min_bars - 1, n - hold - 1):
+            if dates[i] not in step_bset[i]:      # 不是当天原生 B
+                continue
+            entry = opens[i + 1]
+            if not entry:
+                continue
+            ret = (closes[i + hold] - entry) / entry * 100
+            peak = entry
+            mdd = 0.0
+            for k in range(i + 1, i + hold + 1):
+                if highs[k] > peak:
+                    peak = highs[k]
+                dd = (peak - lows[k]) / peak * 100
+                if dd > mdd:
+                    mdd = dd
+            all_b.append((ret, mdd))
+            survived = dates[i] in step_bset[i + 1]   # 次日重算仍在 → 熬过一天
+            if survived:
+                surv_b.append((ret, mdd))
+            else:
+                flash += 1
+    return dict(all_b=all_b, surv_b=surv_b, flash=flash,
+                ok=len(data), tot=len(tickers))
+
+
 def repaint_in_analysis(rt_min_bars=60):
     """量化「补标」(repaint-in)：一根K线当天(它作为最新K线时)没出信号，
     但过 N 天后被重绘补标上 B/S。方法：walk-forward 逐根重算，记录每个信号
@@ -669,6 +729,38 @@ def main():
         _stats("  任意日做多", r["base"])
         print("\n注：realtime 组才是接近真实的收益（信号在该K线为最新时当场就出）；")
         print("    repainted 组把事后重绘冒出来的点也算进去，会显著高估。均未扣手续费/滑点。")
+        return
+
+    if "--bfwd" in sys.argv:
+        import statistics as st
+        args = sys.argv[sys.argv.index("--bfwd") + 1:]
+        hold = int(args[0]) if args and args[0].isdigit() else 5
+        r = b_forward_survive(hold)
+        na, ns = len(r["all_b"]), len(r["surv_b"])
+        print(f"\n== B 买点前向表现 · 次日开盘入场→持有 {hold} 交易日 ==")
+        print(f"数据覆盖：{r['ok']}/{r['tot']} 只")
+        print(f"realtime 原生 B 共 {na} 个；其中一日闪现(次日即消失)剔除 {r['flash']} 个"
+              f"（{r['flash']/na*100:.1f}%），保留 {ns} 个\n" if na else "无样本\n")
+
+        def _row(name, arr):
+            if not arr:
+                print(f"{name:<26} 无样本"); return
+            rets = [x[0] for x in arr]
+            mdds = [x[1] for x in arr]
+            n = len(arr)
+            win = sum(1 for x in rets if x > 0) / n * 100
+            print(f"{name:<26}{n:>6}"
+                  f"{sum(rets)/n:>8.2f}%{st.median(rets):>8.2f}%{win:>7.1f}%"
+                  f"{sum(mdds)/n:>8.2f}%{st.median(mdds):>8.2f}%{max(mdds):>8.1f}%")
+
+        hdr = (f"{'':<26}{'样本':>6}{'收益均':>9}{'收益中':>9}{'胜率':>7}"
+               f"{'回撤均':>9}{'回撤中':>9}{'回撤max':>8}")
+        print(hdr)
+        _row("全部 realtime B", r["all_b"])
+        _row("剔除一日闪现后 B", r["surv_b"])
+        print("\n注：收益=(持有末日收盘−次日开盘)/次日开盘；回撤=持仓期内从运行最高价到")
+        print("    最低价的最大跌幅(正数,越大越难拿)；一日闪现=B次日重算即消失、实盘抓不住。")
+        print("    全 realtime 信号(滚动504日窗口)，未扣手续费/滑点。")
         return
 
     if "--curves" in sys.argv:

@@ -77,3 +77,13 @@ jobs:
             cat strat_result.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run B forward + survival filter
+        run: |
+          python analyze.py --bfwd "${{ inputs.hold }}" | tee bfwd_result.txt
+          {
+            echo "### B买点前向收益+回撤 · 持有 ${{ inputs.hold }} 交易日（剔除一日闪现B）"
+            echo '```'
+            cat bfwd_result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
