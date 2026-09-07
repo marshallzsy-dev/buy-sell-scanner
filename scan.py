@@ -477,7 +477,7 @@ def s_symbol_stats(df, final_s_dates, hold=STATS_HOLD,
     }
 
 
-def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
+def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum=None):
     et = meta["run_et"]
     stamp = et.strftime("%Y-%m-%d %H:%M")
 
@@ -555,13 +555,14 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
         dot = f'<span class="dot {cls} reldot" title="{tip}"></span>'
         link = (f'<a class="chart-link" data-sym="{code}">{code}</a>' if code in chart_data
                 else f'<a href="{tv_url(code)}" target="_blank" rel="noopener">{code}</a>')
-        return f'<td class="code">{dot}{link}</td>'
+        star = f'<span class="star" data-sym="{code}" title="加入/移出自选">☆</span>'
+        return f'<td class="code">{dot}{link}{star}</td>'
 
     def row_bs(item):
         code = item["ticker"]
         st = bstats.get(code)
         return (
-            f'<tr>'
+            f'<tr data-tbl="b" data-sym="{code}">'
             f'{_code_cell(code, st, "B")}'
             f'<td data-label="最近B日期">{item["last_date"]}</td>'
             f'<td data-label="时点"><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
@@ -574,7 +575,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
         code = item["ticker"]
         st = sstats.get(code)
         return (
-            f'<tr>'
+            f'<tr data-tbl="s" data-sym="{code}">'
             f'{_code_cell(code, st, "S")}'
             f'<td data-label="最近S日期">{item["last_date"]}</td>'
             f'<td data-label="时点"><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
@@ -636,6 +637,18 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
     # 图表数据内联（紧凑 JSON）
     chart_json = json.dumps(chart_data, ensure_ascii=False, separators=(",", ":"))
 
+    # 全池摘要（自选股用）：附上可信度灯 class（有画像才有）与「是否内嵌K线图」
+    uni = []
+    for t, d in sorted((usum or {}).items()):
+        e = dict(d)
+        if t in bstats:
+            e["rb"] = _reliability(bstats[t], "B")[0]
+        if t in sstats:
+            e["rs"] = _reliability(sstats[t], "S")[0]
+        e["c"] = 1 if t in chart_data else 0
+        uni.append(e)
+    uni_json = json.dumps(uni, ensure_ascii=False, separators=(",", ":"))
+
     # lightweight-charts 库：内联优先，失败回退 CDN
     lib = meta.get("lwc_lib")
     if lib:
@@ -669,6 +682,27 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
   .dot.r {{ background:#e5484d; }} .dot.u {{ background:#4d5866; }}
   .reldot {{ margin-right:6px; vertical-align:middle; cursor:help; }}
   .cnt {{ color:var(--muted); font-size:12px; font-weight:400; }}
+  /* 自选股 */
+  .star {{ cursor:pointer; color:#4d5866; margin-left:7px; font-size:14px; user-select:none; }}
+  .star.on {{ color:#f0c040; }}
+  .wl-head {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:6px; }}
+  .wl-search {{ flex:1; min-width:160px; background:#0d1117; border:1px solid var(--line);
+    color:var(--text); border-radius:8px; padding:7px 10px; font-size:13px; outline:none; }}
+  .wl-search:focus {{ border-color:#58a6ff; }}
+  .wl-row {{ display:flex; align-items:center; gap:8px; padding:8px 0;
+    border-bottom:1px solid var(--line); flex-wrap:wrap; }}
+  .wl-row:last-child {{ border-bottom:none; }}
+  .wl-code {{ color:var(--text); text-decoration:none; font-weight:600;
+    border-bottom:1px dotted var(--muted); }}
+  .wl-code:hover {{ color:#58a6ff; }}
+  .wl-spacer {{ flex:1; }}
+  .badge {{ font-size:11px; padding:1px 7px; border-radius:10px; white-space:nowrap; }}
+  .badge.b {{ background:rgba(47,179,90,.18); color:#5fd98a; }}
+  .badge.s {{ background:rgba(214,60,156,.18); color:#f07fce; }}
+  .badge.n {{ background:rgba(139,152,169,.15); color:var(--muted); }}
+  .filt {{ font-size:12px; color:var(--muted); cursor:pointer; user-select:none;
+    display:inline-flex; align-items:center; gap:5px; font-weight:400; }}
+  .filt input {{ accent-color:#58a6ff; }}
   /* 首屏定位 + 风险声明 */
   .intro {{ background:var(--panel); border:1px solid var(--line); border-left:3px solid #58a6ff;
     border-radius:12px; padding:14px 16px; margin-top:14px; font-size:13px; line-height:1.7; }}
@@ -761,8 +795,23 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
     </div>
   </div>
 
+  <section id="wl-sec">
+    <div class="stitle"><span class="dot" style="background:#f0c040"></span> ⭐ 我的自选 <span class="cnt" id="wl-cnt">（0）</span></div>
+    <div class="wl-head">
+      <input class="wl-search" id="wl-search" list="wl-list" autocomplete="off"
+        placeholder="输入代码加入自选（如 NVDA），回车确认">
+      <datalist id="wl-list"></datalist>
+    </div>
+    <div id="wl-body"></div>
+    <div style="color:var(--muted);font-size:11px;padding:6px 2px 2px;line-height:1.6;">
+      自选仅存在<b>本浏览器</b>（不跨设备、无需登录）。收藏的股票每天都会显示状态——即使当天没有信号。
+    </div>
+  </section>
+
   <section>
-    <div class="stitle"><span class="dot g"></span> B 买点 · 当日/近三日 <span class="cnt">（{len(b_list)}）</span></div>
+    <div class="stitle"><span class="dot g"></span> B 买点 · 当日/近三日 <span class="cnt">（{len(b_list)}）</span>
+      <span class="wl-spacer"></span>
+      <label class="filt"><input type="checkbox" class="wl-only" data-tbl="b"> 只看自选</label></div>
     <table class="dtable">
       <thead><tr><th>代码</th><th>最近B日期</th><th>时点</th><th>现价</th>
         <th class="num" title="历史实时B信号：次日开盘入场、持有5交易日、末日收盘平仓的平均收益">B后5日均收益</th>
@@ -774,7 +823,9 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
   </section>
 
   <section>
-    <div class="stitle"><span class="dot p"></span> S 卖点 · 当日/近三日 <span class="cnt">（{len(s_list)}）</span></div>
+    <div class="stitle"><span class="dot p"></span> S 卖点 · 当日/近三日 <span class="cnt">（{len(s_list)}）</span>
+      <span class="wl-spacer"></span>
+      <label class="filt"><input type="checkbox" class="wl-only" data-tbl="s"> 只看自选</label></div>
     <table class="dtable">
       <thead><tr><th>代码</th><th>最近S日期</th><th>时点</th><th>现价</th>
         <th class="num" title="剔除一日闪现S后：S次日开盘为基准、持有5日内每日回撤（仅计跌破部分）的平均值，越深说明S后越易回落">S后5日均回撤</th>
@@ -884,12 +935,94 @@ function closeChart() {{
   if (_chart) {{ _chart.remove(); _chart = null; }}
 }}
 
-document.querySelectorAll('a.chart-link').forEach(a => {{
-  a.addEventListener('click', () => openChart(a.dataset.sym));
+window.openChart = openChart;
+// 事件委托：服务端渲染的行 + 自选股动态渲染的行都生效
+document.addEventListener('click', (e) => {{
+  const a = e.target.closest && e.target.closest('a.chart-link');
+  if (a) {{ e.preventDefault(); openChart(a.dataset.sym); }}
 }});
 $('m-close').addEventListener('click', closeChart);
 $('modal').addEventListener('click', (e) => {{ if (e.target === $('modal')) closeChart(); }});
 document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeChart(); }});
+</script>
+
+<script>
+window.__UNIVERSE__ = {uni_json};
+(function() {{
+  var UNI = window.__UNIVERSE__ || [];
+  var byT = {{}}; UNI.forEach(function(d) {{ byT[d.t] = d; }});
+  var KEY = 's1_watchlist_v1';
+  function load() {{ try {{ return JSON.parse(localStorage.getItem(KEY)) || []; }} catch (e) {{ return []; }} }}
+  function save(l) {{ try {{ localStorage.setItem(KEY, JSON.stringify(l)); }} catch (e) {{}} }}
+  function toggle(t) {{ var l = load(); var i = l.indexOf(t); if (i >= 0) l.splice(i, 1); else l.push(t); save(l); refresh(); }}
+  function add(t) {{ t = (t || '').trim().toUpperCase(); if (!t) return; var l = load(); if (l.indexOf(t) < 0) {{ l.push(t); save(l); }} refresh(); }}
+
+  function relDot(cls) {{ return cls ? '<span class="dot ' + cls + ' reldot"></span> ' : ''; }}
+  function codeHtml(t) {{
+    var d = byT[t];
+    if (d && d.c) return '<a class="wl-code chart-link" data-sym="' + t + '">' + t + '</a>';
+    return '<a class="wl-code" href="https://www.tradingview.com/chart/?symbol=' + encodeURIComponent(t) + '" target="_blank" rel="noopener">' + t + '</a>';
+  }}
+  function rowHtml(t) {{
+    var d = byT[t];
+    var star = '<span class="star on" data-sym="' + t + '" title="移出自选">★</span>';
+    if (!d) {{
+      return '<div class="wl-row">' + star + codeHtml(t) +
+        '<span class="wl-spacer"></span><span class="badge n">今日未覆盖</span></div>';
+    }}
+    var rel = d.ab ? relDot(d.rb) : (d.as ? relDot(d.rs) : '');
+    var mid = '';
+    if (d.ab) mid += '<span class="badge b">B 生效 ' + d.lb + '</span> ';
+    if (d.as) mid += '<span class="badge s">S 生效 ' + d.ls + '</span> ';
+    if (!d.ab && !d.as) {{
+      var last = (d.lb || d.ls) ? ('最近 ' + (d.lb > d.ls ? 'B ' + d.lb : 'S ' + d.ls)) : '无历史信号';
+      mid = '<span class="badge n">无生效信号</span> <span style="color:var(--muted);font-size:12px">' + last + '</span>';
+    }}
+    var price = (d.p != null) ? ('$' + d.p) : '-';
+    return '<div class="wl-row">' + star + rel + codeHtml(t) +
+      '<span class="wl-spacer"></span>' + mid +
+      '<span style="color:var(--muted);font-size:12px;min-width:62px;text-align:right">' + price + '</span></div>';
+  }}
+  function syncStars() {{
+    var set = {{}}; load().forEach(function(t) {{ set[t] = 1; }});
+    document.querySelectorAll('.star').forEach(function(el) {{
+      var on = !!set[el.dataset.sym];
+      el.textContent = on ? '★' : '☆';
+      el.classList.toggle('on', on);
+    }});
+  }}
+  function applyFilter() {{
+    document.querySelectorAll('.wl-only').forEach(function(cb) {{
+      var set = {{}}; load().forEach(function(t) {{ set[t] = 1; }});
+      document.querySelectorAll('tr[data-tbl="' + cb.dataset.tbl + '"]').forEach(function(tr) {{
+        if (tr.dataset.sym) tr.style.display = (!cb.checked || set[tr.dataset.sym]) ? '' : 'none';
+      }});
+    }});
+  }}
+  function refresh() {{
+    var l = load();
+    var cnt = document.getElementById('wl-cnt'); if (cnt) cnt.textContent = '（' + l.length + '）';
+    var body = document.getElementById('wl-body');
+    if (body) {{
+      body.innerHTML = l.length
+        ? l.slice().sort().map(rowHtml).join('')
+        : '<div style="color:var(--muted);font-size:13px;padding:6px 0">点任意股票行的 ☆ 收藏，或上方输入代码添加。</div>';
+    }}
+    syncStars();
+    applyFilter();
+  }}
+
+  var dl = document.getElementById('wl-list');
+  if (dl) UNI.forEach(function(d) {{ var o = document.createElement('option'); o.value = d.t; dl.appendChild(o); }});
+  document.addEventListener('click', function(e) {{
+    var s = e.target.closest ? e.target.closest('.star') : null;
+    if (s) {{ e.preventDefault(); e.stopPropagation(); toggle(s.dataset.sym); }}
+  }});
+  var inp = document.getElementById('wl-search');
+  if (inp) inp.addEventListener('keydown', function(e) {{ if (e.key === 'Enter') {{ add(inp.value); inp.value = ''; }} }});
+  document.querySelectorAll('.wl-only').forEach(function(cb) {{ cb.addEventListener('change', applyFilter); }});
+  refresh();
+}})();
 </script>
 </body>
 </html>"""
@@ -1060,6 +1193,7 @@ def main():
     data_last = ""
     chart_data = {}   # {ticker: {'bars':[...], 'markers':[...]}}
     computed = {}     # {ticker: cur}，缓存本次算好的信号，供 warning 补图
+    usum = {}         # {ticker: 全池精简摘要}，供前端「自选股」用（有没有信号都收录）
 
     for t, df in data.items():
         try:
@@ -1105,6 +1239,16 @@ def main():
         # 本次产生消失告警的股票也存图（方便直接看消失节点原本所在的 K 线）
         if tw and t not in chart_data:
             chart_data[t] = build_chart_data(df, cur)
+
+        # 全池摘要（自选股用）：无论有无信号都记一条精简状态
+        usum[t] = {
+            "t": t,
+            "p": round(float(price), 2),
+            "lb": (max(cur["b_dates"]) if cur["b_dates"] else ""),
+            "ls": (max(cur["s_dates"]) if cur["s_dates"] else ""),
+            "ab": 1 if recent_b else 0,     # 近三日内有生效 B
+            "as": 1 if recent_s else 0,     # 近三日内有生效 S
+        }
 
         # 保存本次快照
         new_tickers_state[t] = {
@@ -1193,7 +1337,7 @@ def main():
         "lwc_lib": load_lwc_lib(),
         "repaint_stats": rstats,
     }
-    html = render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats)
+    html = render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum)
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
 
