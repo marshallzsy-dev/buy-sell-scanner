@@ -481,52 +481,56 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
     et = meta["run_et"]
     stamp = et.strftime("%Y-%m-%d %H:%M")
 
+    def _mt(label):     # 手机卡片模式下每个数值格的行标签
+        return f' data-label="{label}"'
+
     def _fwd_cell(st):
         if not st or st.get("fwd_avg") is None:
-            return '<td class="num" style="color:var(--muted)">—</td>'
+            return f'<td class="num"{_mt("B后5日均收益")} style="color:var(--muted)">—</td>'
         v = st["fwd_avg"]
         color = "#5fd98a" if v > 0 else ("#f07fce" if v < 0 else "var(--muted)")
-        return (f'<td class="num" style="color:{color}" '
+        return (f'<td class="num"{_mt("B后5日均收益")} style="color:{color}" '
                 f'title="{st["fwd_n"]} 个存活B样本（已剔除 {st.get("flash", 0)} 个一日闪现）">{v:+.1f}%</td>')
 
     def _win_cell(st):
         if not st or st.get("win_rate") is None:
-            return '<td class="num" style="color:var(--muted)">—</td>'
+            return f'<td class="num"{_mt("B后5日胜率")} style="color:var(--muted)">—</td>'
         r = st["win_rate"]
         color = "#5fd98a" if r >= 55 else ("#f0a020" if r >= 45 else "#f07fce")
-        return (f'<td class="num" style="color:{color}" '
+        return (f'<td class="num"{_mt("B后5日胜率")} style="color:{color}" '
                 f'title="剔除一日闪现B后，{st["fwd_n"]} 个存活B里持有5日末收为正的比例">'
                 f'{r:.0f}%</td>')
 
     def _dd_cell(st):
         if not st or st.get("dd_avg") is None:
-            return '<td class="num" style="color:var(--muted)">—</td>'
-        return (f'<td class="num" style="color:var(--amber)" '
+            return f'<td class="num"{_mt("B后5日均回撤")} style="color:var(--muted)">—</td>'
+        return (f'<td class="num"{_mt("B后5日均回撤")} style="color:var(--amber)" '
                 f'title="持有5日内每日相对入场价回撤的平均值（仅计跌破入场价的部分）">'
                 f'{st["dd_avg"]:.1f}%</td>')
 
     def _dis_cell(st, side="B"):
+        lbl = f"{side}消失率"
         if not st or st.get("dis_rate") is None:
-            return '<td class="num" style="color:var(--muted)">—</td>'
+            return f'<td class="num"{_mt(lbl)} style="color:var(--muted)">—</td>'
         r = st["dis_rate"]
         color = "#5fd98a" if r < 20 else ("#f0a020" if r < 50 else "#f07fce")
-        return (f'<td class="num" style="color:{color}" '
+        return (f'<td class="num"{_mt(lbl)} style="color:{color}" '
                 f'title="{st["dis_gone"]}/{st["dis_total"]} 个原生{side}最终被重绘抹掉">{r:.0f}%</td>')
 
     # —— S 卖点画像单元格（S 当见顶/回落信号看：回撤越深、下跌概率越高越有效）——
     def _sdd_cell(st):
         if not st or st.get("dd_avg") is None:
-            return '<td class="num" style="color:var(--muted)">—</td>'
-        return (f'<td class="num" style="color:var(--amber)" '
+            return f'<td class="num"{_mt("S后5日均回撤")} style="color:var(--muted)">—</td>'
+        return (f'<td class="num"{_mt("S后5日均回撤")} style="color:var(--amber)" '
                 f'title="剔除一日闪现S后，{st["n"]} 个存活S：次日开盘为基准、持有5日内每日回撤（仅计跌破部分）的平均值">'
                 f'{st["dd_avg"]:.1f}%</td>')
 
     def _sdown_cell(st):
         if not st or st.get("down_rate") is None:
-            return '<td class="num" style="color:var(--muted)">—</td>'
+            return f'<td class="num"{_mt("S后5日下跌概率")} style="color:var(--muted)">—</td>'
         r = st["down_rate"]
         color = "#5fd98a" if r >= 55 else ("#f0a020" if r >= 45 else "#f07fce")
-        return (f'<td class="num" style="color:{color}" '
+        return (f'<td class="num"{_mt("S后5日下跌概率")} style="color:{color}" '
                 f'title="剔除一日闪现S后，{st["n"]} 个存活S里持有5日末收低于次日开盘的比例（反向胜率）">'
                 f'{r:.0f}%</td>')
 
@@ -559,9 +563,9 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
         return (
             f'<tr>'
             f'{_code_cell(code, st, "B")}'
-            f'<td>{item["last_date"]}</td>'
-            f'<td><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
-            f'<td class="num">{item["price"]:.2f}</td>'
+            f'<td data-label="最近B日期">{item["last_date"]}</td>'
+            f'<td data-label="时点"><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
+            f'<td class="num" data-label="现价">{item["price"]:.2f}</td>'
             f'{_fwd_cell(st)}{_win_cell(st)}{_dd_cell(st)}{_dis_cell(st, "B")}'
             f'</tr>'
         )
@@ -572,9 +576,9 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
         return (
             f'<tr>'
             f'{_code_cell(code, st, "S")}'
-            f'<td>{item["last_date"]}</td>'
-            f'<td><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
-            f'<td class="num">{item["price"]:.2f}</td>'
+            f'<td data-label="最近S日期">{item["last_date"]}</td>'
+            f'<td data-label="时点"><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
+            f'<td class="num" data-label="现价">{item["price"]:.2f}</td>'
             f'{_sdd_cell(st)}{_sdown_cell(st)}{_dis_cell(st, "S")}'
             f'</tr>'
         )
@@ -708,6 +712,28 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
     background:none; border:none; }}
   .modal-close:hover {{ color:var(--text); }}
   #chart {{ width:100%; height:460px; }}
+  /* —— 手机端（≤560px）：宽表转卡片，每行一张卡、字段标签在左值在右 —— */
+  @media (max-width:560px) {{
+    .wrap {{ padding:14px 10px 48px; }}
+    h1 {{ font-size:18px; }}
+    header {{ margin-bottom:4px; }}
+    section {{ padding:12px 12px 4px; }}
+    .intro {{ font-size:12.5px; padding:12px 13px; }}
+    .dtable thead {{ display:none; }}
+    .dtable, .dtable tbody, .dtable tr, .dtable td {{ display:block; width:100%; }}
+    .dtable tr {{ border:1px solid var(--line); border-radius:10px; margin:0 0 10px;
+      padding:8px 12px; background:rgba(255,255,255,.02); }}
+    .dtable td {{ border:none; padding:5px 0; display:flex; justify-content:space-between;
+      align-items:center; gap:14px; text-align:right; }}
+    .dtable td::before {{ content:attr(data-label); color:var(--muted); font-size:11px;
+      font-weight:500; text-align:left; }}
+    .dtable td.code {{ justify-content:flex-start; font-size:16px; padding:2px 0 8px;
+      margin-bottom:4px; border-bottom:1px solid var(--line); }}
+    .dtable td.code::before {{ content:none; }}
+    .dtable td.empty {{ display:block; text-align:center; }}
+    .dtable td.empty::before {{ content:none; }}
+    .dtable td.code a {{ font-size:16px; }}
+  }}
 </style>
 </head>
 <body>
@@ -737,7 +763,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
 
   <section>
     <div class="stitle"><span class="dot g"></span> B 买点 · 当日/近三日 <span class="cnt">（{len(b_list)}）</span></div>
-    <table>
+    <table class="dtable">
       <thead><tr><th>代码</th><th>最近B日期</th><th>时点</th><th>现价</th>
         <th class="num" title="历史实时B信号：次日开盘入场、持有5交易日、末日收盘平仓的平均收益">B后5日均收益</th>
         <th class="num" title="剔除一日闪现B后，持有5交易日末收为正的比例">B后5日胜率</th>
@@ -749,7 +775,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
 
   <section>
     <div class="stitle"><span class="dot p"></span> S 卖点 · 当日/近三日 <span class="cnt">（{len(s_list)}）</span></div>
-    <table>
+    <table class="dtable">
       <thead><tr><th>代码</th><th>最近S日期</th><th>时点</th><th>现价</th>
         <th class="num" title="剔除一日闪现S后：S次日开盘为基准、持有5日内每日回撤（仅计跌破部分）的平均值，越深说明S后越易回落">S后5日均回撤</th>
         <th class="num" title="剔除一日闪现S后：持有5日末收低于次日开盘的比例（反向胜率），越高说明S越可靠">S后5日下跌概率</th>
