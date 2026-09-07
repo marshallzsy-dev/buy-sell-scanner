@@ -47,6 +47,12 @@ WARN_KEEP_DAYS = 7       # Warning 在页面上保留的天数（按检测日历
 HISTORY_PERIOD = "2y"    # 拉取历史长度
 CHART_BARS = 250         # 弹层图表保留的最近 K 线根数（约 1 年）
 
+# 每只上榜股票的 B 信号历史画像（前向收益 / 回撤 / 消失率）
+STATS_HOLD = 5           # 前向持有交易日数（“B 后 5 日”）
+STATS_MIN_BARS = 60      # walk-forward 评估起点（与 analyze.py 口径一致）
+STATS_WIN = 504          # 滚动重算窗口（约 2 年，与 HISTORY_PERIOD 一致）
+STATS_MAX_TICKERS = 150  # 单次最多为多少只上榜股算画像（防 CI 超时的兜底上限）
+
 
 # ---------------------------------------------------------------------------
 # lightweight-charts 库：首次运行下载到 vendor/，之后读取内联（离线自包含）
@@ -341,12 +347,89 @@ def build_chart_data(df, cur):
     return {"bars": bars, "markers": markers}
 
 
-def render_html(b_list, s_list, warnings, meta, chart_data):
+def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
+                   min_bars=STATS_MIN_BARS, win=STATS_WIN):
+    """单只股票的 B 信号历史画像，walk-forward 逐根重算 realtime B 信号后计算：
+      - fwd_avg : realtime B「次日开盘入场→持有 hold 交易日→末日收盘平仓」的平均收益率(%)
+      - mdd_avg : 上述持有期内相对入场价的平均最大回撤(%，负数=最深跌幅)
+      - dis_rate: realtime 原生出现的 B 信号里，最终在定型(重绘后)信号中消失的比例(%)
+    realtime 判定 / 入场出场口径与 analyze.py 的 forward_all 完全一致（剥掉重绘 lookahead）。
+    只对上榜股票调用（成本 O(bars) 每根重算 × 有信号的股票），返回 dict 或 None（历史不足）。"""
+    opens = [float(x) for x in df["Open"].tolist()]
+    lows = [float(x) for x in df["Low"].tolist()]
+    closes = [float(x) for x in df["Close"].tolist()]
+    dates = [d.strftime("%Y-%m-%d") for d in df.index]
+    n = len(closes)
+    if n < min_bars + 2:
+        return None
+
+    final_set = set(final_b_dates)
+    native = []          # [(bar_index, date_str)] realtime B 首次以最新K线当场出现的点
+    seen = set()
+    for i in range(min_bars - 1, n):
+        lo = max(0, i + 1 - win)
+        try:
+            cur = compute_signals(df.iloc[lo:i + 1])
+        except Exception:
+            continue
+        if not cur["dates"]:
+            continue
+        if cur["dates"][-1] in set(cur["b_dates"]):   # 最新那根当场就是 B → 实时可见
+            d = dates[i]
+            if d not in seen:
+                seen.add(d)
+                native.append((i, d))
+    if not native:
+        return None
+
+    fwd, mdd = [], []
+    for i, d in native:
+        eo = opens[i + 1] if i + 1 < n else 0.0
+        if i + hold < n and eo:
+            fwd.append((closes[i + hold] - eo) / eo * 100)
+            low_win = min(lows[i + 1:i + hold + 1])   # 持有期内最低价
+            mdd.append((low_win - eo) / eo * 100)     # 相对入场价的最深跌幅（负数）
+    total = len(native)
+    gone = sum(1 for _, d in native if d not in final_set)
+    return {
+        "fwd_avg": (sum(fwd) / len(fwd)) if fwd else None,
+        "fwd_n": len(fwd),
+        "mdd_avg": (sum(mdd) / len(mdd)) if mdd else None,
+        "dis_rate": (gone / total * 100) if total else None,
+        "dis_gone": gone,
+        "dis_total": total,
+    }
+
+
+def render_html(b_list, s_list, warnings, meta, chart_data, bstats):
     et = meta["run_et"]
     stamp = et.strftime("%Y-%m-%d %H:%M")
 
+    def _fwd_cell(st):
+        if not st or st.get("fwd_avg") is None:
+            return '<td class="num" style="color:var(--muted)">—</td>'
+        v = st["fwd_avg"]
+        color = "#5fd98a" if v > 0 else ("#f07fce" if v < 0 else "var(--muted)")
+        return (f'<td class="num" style="color:{color}" '
+                f'title="{st["fwd_n"]} 个实时B样本">{v:+.1f}%</td>')
+
+    def _mdd_cell(st):
+        if not st or st.get("mdd_avg") is None:
+            return '<td class="num" style="color:var(--muted)">—</td>'
+        return (f'<td class="num" style="color:var(--amber)" '
+                f'title="持有5日相对入场价的平均最深跌幅">{st["mdd_avg"]:.1f}%</td>')
+
+    def _dis_cell(st):
+        if not st or st.get("dis_rate") is None:
+            return '<td class="num" style="color:var(--muted)">—</td>'
+        r = st["dis_rate"]
+        color = "#5fd98a" if r < 20 else ("#f0a020" if r < 50 else "#f07fce")
+        return (f'<td class="num" style="color:{color}" '
+                f'title="{st["dis_gone"]}/{st["dis_total"]} 个原生B最终被重绘抹掉">{r:.0f}%</td>')
+
     def row_bs(item):
         code = item["ticker"]
+        st = bstats.get(code)
         has = code in chart_data
         cell = (f'<a class="chart-link" data-sym="{code}">{code}</a>' if has
                 else f'<a href="{tv_url(code)}" target="_blank" rel="noopener">{code}</a>')
@@ -356,6 +439,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data):
             f'<td>{item["last_date"]}</td>'
             f'<td><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
             f'<td class="num">{item["price"]:.2f}</td>'
+            f'{_fwd_cell(st)}{_mdd_cell(st)}{_dis_cell(st)}'
             f'</tr>'
         )
 
@@ -375,8 +459,8 @@ def render_html(b_list, s_list, warnings, meta, chart_data):
             f'</tr>'
         )
 
-    b_rows = "\n".join(row_bs(x) for x in b_list) or '<tr><td colspan="4" class="empty">近三日无 B 买点</td></tr>'
-    s_rows = "\n".join(row_bs(x) for x in s_list) or '<tr><td colspan="4" class="empty">近三日无 S 卖点</td></tr>'
+    b_rows = "\n".join(row_bs(x) for x in b_list) or '<tr><td colspan="7" class="empty">近三日无 B 买点</td></tr>'
+    s_rows = "\n".join(row_bs(x) for x in s_list) or '<tr><td colspan="7" class="empty">近三日无 S 卖点</td></tr>'
     warn_rows = "\n".join(row_warn(w) for w in warnings) or \
         '<tr><td colspan="4" class="empty">暂无消失记录（需累积历史快照，运行几天后逐步显现）</td></tr>'
 
@@ -489,7 +573,10 @@ def render_html(b_list, s_list, warnings, meta, chart_data):
   <section>
     <div class="stitle"><span class="dot g"></span> B 买点 · 当日/近三日 <span class="cnt">（{len(b_list)}）</span></div>
     <table>
-      <thead><tr><th>代码</th><th>最近B日期</th><th>时点</th><th>现价</th></tr></thead>
+      <thead><tr><th>代码</th><th>最近B日期</th><th>时点</th><th>现价</th>
+        <th class="num" title="历史实时B信号：次日开盘入场、持有5交易日、末日收盘平仓的平均收益">B后5日均收益</th>
+        <th class="num" title="历史实时B信号：持有5日内相对入场价的平均最深跌幅">B后5日回撤</th>
+        <th class="num" title="历史实时B信号中，最终被重绘抹掉（消失）的比例">B消失率</th></tr></thead>
       <tbody>{b_rows}</tbody>
     </table>
   </section>
@@ -497,7 +584,10 @@ def render_html(b_list, s_list, warnings, meta, chart_data):
   <section>
     <div class="stitle"><span class="dot p"></span> S 卖点 · 当日/近三日 <span class="cnt">（{len(s_list)}）</span></div>
     <table>
-      <thead><tr><th>代码</th><th>最近S日期</th><th>时点</th><th>现价</th></tr></thead>
+      <thead><tr><th>代码</th><th>最近S日期</th><th>时点</th><th>现价</th>
+        <th class="num" title="该股历史实时B信号：次日开盘入场、持有5交易日、末日收盘平仓的平均收益">B后5日均收益</th>
+        <th class="num" title="该股历史实时B信号：持有5日内相对入场价的平均最深跌幅">B后5日回撤</th>
+        <th class="num" title="该股历史实时B信号中，最终被重绘抹掉（消失）的比例">B消失率</th></tr></thead>
       <tbody>{s_rows}</tbody>
     </table>
   </section>
@@ -524,6 +614,10 @@ def render_html(b_list, s_list, warnings, meta, chart_data):
 
   <footer>
     · 点击代码弹出该股 K 线图，B/S 买卖点已标在图上（可缩放、拖动）；无图表数据的代码则跳 TradingView。<br>
+    · <b>B后5日均收益 / B后5日回撤 / B消失率</b>：均为该股<b>历史</b>画像（非本次信号预测），基于 walk-forward 逐根重算的
+      <b>实时(realtime)B 信号</b>（剥掉重绘 lookahead）。收益=次日开盘入场、持有 5 交易日、末日收盘平仓的平均值；
+      回撤=持有期内相对入场价的平均最深跌幅；消失率=实时出现过的 B 里最终被重绘抹掉的比例（越低越可信）。
+      单只样本量有限、未扣手续费，仅供横向参考。<br>
     · 本工具复刻 “S1 Formula v34” 指标，<b>该算法会重绘</b>：历史 K 线上的买卖点会随新数据变动/消失，Warning 区即用于追踪这一现象。<br>
     · 抓取失败/跳过的代码：{skipped_txt}
   </footer>
@@ -606,14 +700,36 @@ document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeChar
 # ---------------------------------------------------------------------------
 # 邮件正文（精简版，邮箱客户端友好：内联样式 + 纯表格 + 浅色主题）
 # ---------------------------------------------------------------------------
-def render_email(b_list, s_list, warnings, meta):
+def render_email(b_list, s_list, warnings, meta, bstats):
     """生成每日邮件 HTML 正文。与 dashboard 不同：无脚本/无图表，
     用内联样式和简单表格，兼容 Gmail/Outlook 等客户端。"""
     stamp = meta["run_et"].strftime("%Y-%m-%d %H:%M")
 
+    def _num_td(txt, color):
+        return (f'<td style="padding:8px;border-top:1px solid #edf0f4;text-align:right;'
+                f'font-variant-numeric:tabular-nums;color:{color};">{txt}</td>')
+
+    def _stat_tds(st):
+        if not st:
+            m = _num_td("—", "#9aa3b2")
+            return m + m + m
+        fwd = st.get("fwd_avg")
+        mdd = st.get("mdd_avg")
+        dis = st.get("dis_rate")
+        fwd_td = (_num_td(f"{fwd:+.1f}%", "#1a8f45" if fwd > 0 else "#b8348a")
+                  if fwd is not None else _num_td("—", "#9aa3b2"))
+        mdd_td = (_num_td(f"{mdd:.1f}%", "#d97706") if mdd is not None
+                  else _num_td("—", "#9aa3b2"))
+        if dis is None:
+            dis_td = _num_td("—", "#9aa3b2")
+        else:
+            dc = "#1a8f45" if dis < 20 else ("#d97706" if dis < 50 else "#b8348a")
+            dis_td = _num_td(f"{dis:.0f}%", dc)
+        return fwd_td + mdd_td + dis_td
+
     def bs_rows(items, empty_txt):
         if not items:
-            return (f'<tr><td colspan="4" style="padding:10px 8px;color:#8a94a6;'
+            return (f'<tr><td colspan="7" style="padding:10px 8px;color:#8a94a6;'
                     f'text-align:center;">{empty_txt}</td></tr>')
         out = []
         for it in items:
@@ -627,6 +743,7 @@ def render_email(b_list, s_list, warnings, meta):
                 f'<td style="padding:8px;border-top:1px solid #edf0f4;">'
                 f'<span style="font-size:12px;padding:2px 8px;border-radius:10px;background:{pill_bg};color:{pill_fg};">{it["recency"]}</span></td>'
                 f'<td style="padding:8px;border-top:1px solid #edf0f4;text-align:right;font-variant-numeric:tabular-nums;">{it["price"]:.2f}</td>'
+                f'{_stat_tds(bstats.get(it["ticker"]))}'
                 f'</tr>'
             )
         return "\n".join(out)
@@ -652,8 +769,9 @@ def render_email(b_list, s_list, warnings, meta):
         return "\n".join(out)
 
     def section(title, dot, count, headers, rows_html):
+        # 数值列（现价及其后的统计列，索引 >=3）右对齐，与单元格一致
         ths = "".join(
-            f'<th style="text-align:{"right" if i==len(headers)-1 else "left"};'
+            f'<th style="text-align:{"right" if (i>=3 or i==len(headers)-1) else "left"};'
             f'padding:6px 8px;color:#8a94a6;font-size:11px;font-weight:600;'
             f'text-transform:uppercase;letter-spacing:.4px;">{h}</th>'
             for i, h in enumerate(headers)
@@ -671,10 +789,10 @@ def render_email(b_list, s_list, warnings, meta):
       </td></tr>"""
 
     b_sec = section("B 买点 · 当日/近三日", "#2fb35a", len(b_list),
-                    ["代码", "最近B日期", "时点", "现价"],
+                    ["代码", "最近B日期", "时点", "现价", "B后5日均收益", "B后5日回撤", "B消失率"],
                     bs_rows(b_list, "近三日无 B 买点"))
     s_sec = section("S 卖点 · 当日/近三日", "#d63c9c", len(s_list),
-                    ["代码", "最近S日期", "时点", "现价"],
+                    ["代码", "最近S日期", "时点", "现价", "B后5日均收益", "B后5日回撤", "B消失率"],
                     bs_rows(s_list, "近三日无 S 卖点"))
     w_sec = section("⚠ 近期消失的买卖点", "#f0a020", len(warnings),
                     ["代码", "类型", "消失节点", "检测于"],
@@ -812,6 +930,27 @@ def main():
         if t not in chart_data and t in computed and t in data:
             chart_data[t] = build_chart_data(data[t], computed[t])
 
+    # 上榜股票（近三日 B/S）的 B 信号历史画像：前向收益 / 回撤 / 消失率。
+    # 只对上榜股算（walk-forward 逐根重算成本较高），并设上限兜底防 CI 超时。
+    stat_tickers = [x["ticker"] for x in b_list] + [x["ticker"] for x in s_list]
+    seen_st = set()
+    stat_tickers = [t for t in stat_tickers if not (t in seen_st or seen_st.add(t))]
+    bstats = {}
+    if len(stat_tickers) > STATS_MAX_TICKERS:
+        print(f"⚠ 上榜 {len(stat_tickers)} 只超过画像上限 {STATS_MAX_TICKERS}，"
+              f"仅为前 {STATS_MAX_TICKERS} 只计算 B 画像。", flush=True)
+        stat_tickers = stat_tickers[:STATS_MAX_TICKERS]
+    print(f"计算 {len(stat_tickers)} 只上榜股的 B 信号历史画像 ...", flush=True)
+    for t in stat_tickers:
+        if t in data and t in computed:
+            try:
+                st = b_symbol_stats(data[t], computed[t]["b_dates"])
+            except Exception as e:
+                print(f"  {t} 画像计算失败: {e}", flush=True)
+                st = None
+            if st:
+                bstats[t] = st
+
     # 重绘率统计：把「昨日→今日」这一步的信号存活情况累积进 state（云端逐日累积，供 dashboard 展示）。
     # 用 prev_run < today 作闸：同一天重复跑（如手动 dispatch 多次）不会重复计入。
     prev_run = next((v.get("run_date") for v in prev_tickers.values() if v.get("run_date")), None)
@@ -835,7 +974,7 @@ def main():
         "lwc_lib": load_lwc_lib(),
         "repaint_stats": rstats,
     }
-    html = render_html(b_list, s_list, warnings, meta, chart_data)
+    html = render_html(b_list, s_list, warnings, meta, chart_data, bstats)
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -848,7 +987,7 @@ def main():
 
     # 邮件正文 + 主题（供 CI 发信；本地跑也会生成，无害）
     with open(EMAIL_HTML, "w", encoding="utf-8") as f:
-        f.write(render_email(b_list, s_list, warnings, meta))
+        f.write(render_email(b_list, s_list, warnings, meta, bstats))
     subject = f"S1 扫描 {today_str} · B{len(b_list)} / S{len(s_list)} / 消失{len(warnings)}"
     with open(EMAIL_SUBJECT, "w", encoding="utf-8") as f:
         f.write(subject)
