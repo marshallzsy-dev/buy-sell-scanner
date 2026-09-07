@@ -536,20 +536,30 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
                 f'{r:.0f}%</td>')
 
     def _reliability(st, side):
-        """综合可信度红绿灯（仅历史画像，不预示未来）：
-        消失率低 + 方向命中率过半 → 绿；消失率高或命中偏弱 → 红；其余黄。"""
+        """可信度红绿灯（仅历史，不预示未来；**不看消失率**，只看剔除一日闪现后的表现）：
+          B：5 日胜率 + 5 日平均收益率。胜率≥55%且均收益>0→绿；胜率<45%或均收益≤0→红；其余黄。
+          S（见顶信号）：5 日下跌概率 + 5 日平均回撤幅度。概率≥55%且回撤≤-1.5%→绿；
+             概率<45%或回撤≥-0.5%→红；其余黄。"""
         if not st:
             return ("u", "该股暂无足够历史信号，无法评估可信度")
-        dis = st.get("dis_rate")
-        good = st.get("win_rate") if side == "B" else st.get("down_rate")
-        gname = "5日胜率" if side == "B" else "5日下跌概率"
-        if dis is None or good is None:
-            return ("u", "样本不足，无法评估可信度")
-        if dis < 30 and good >= 55:
-            return ("g", f"可信度高：消失率 {dis:.0f}% 偏低、{gname} {good:.0f}% 过半（仅历史，不预示未来）")
-        if dis >= 50 or good < 45:
-            return ("r", f"可信度低：消失率 {dis:.0f}% 偏高或 {gname} {good:.0f}% 偏弱，谨慎（仅历史）")
-        return ("a", f"可信度中：消失率 {dis:.0f}%、{gname} {good:.0f}% 一般（仅历史）")
+        if side == "B":
+            wr, ret = st.get("win_rate"), st.get("fwd_avg")
+            if wr is None or ret is None:
+                return ("u", "样本不足，无法评估可信度")
+            if wr >= 55 and ret > 0:
+                return ("g", f"可信度高：剔除一日闪现后 5日胜率 {wr:.0f}%、均收益 {ret:+.1f}%（不看消失率）")
+            if wr < 45 or ret <= 0:
+                return ("r", f"可信度低：5日胜率 {wr:.0f}% 或均收益 {ret:+.1f}% 偏弱（不看消失率）")
+            return ("a", f"可信度中：5日胜率 {wr:.0f}%、均收益 {ret:+.1f}%（不看消失率）")
+        else:
+            dr, dd = st.get("down_rate"), st.get("dd_avg")
+            if dr is None or dd is None:
+                return ("u", "样本不足，无法评估可信度")
+            if dr >= 55 and dd <= -1.5:
+                return ("g", f"可信度高：剔除一日闪现后 5日下跌概率 {dr:.0f}%、均回撤 {dd:.1f}%（不看消失率）")
+            if dr < 45 or dd >= -0.5:
+                return ("r", f"可信度低：5日下跌概率 {dr:.0f}% 或均回撤 {dd:.1f}% 偏弱（不看消失率）")
+            return ("a", f"可信度中：5日下跌概率 {dr:.0f}%、均回撤 {dd:.1f}%（不看消失率）")
 
     def _code_cell(code, st, side):
         cls, tip = _reliability(st, side)
@@ -788,10 +798,10 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
       请把它当筛选工具，务必自行判断、控制仓位与风险。数据可能延迟或缺失，不保证准确。
     </div>
     <div class="legend">
-      每行代码前的可信度灯（<b>仅代表该股历史表现，不预示未来</b>）：
-      <span class="dot g" style="margin:0 3px 0 6px"></span><b>高</b>＝消失率低且方向命中过半&nbsp;·&nbsp;
+      每行代码前的可信度灯（<b>仅看剔除一日闪现后的命中率与收益/回撤，不含消失率；仅代表历史、不预示未来</b>）：
+      <span class="dot g" style="margin:0 3px 0 6px"></span><b>高</b>＝B胜率≥55%且均收益&gt;0（S下跌概率≥55%且回撤够深）&nbsp;·&nbsp;
       <span class="dot a" style="margin:0 3px"></span><b>中</b>＝一般&nbsp;·&nbsp;
-      <span class="dot r" style="margin:0 3px"></span><b>低</b>＝消失率高或命中偏弱，谨慎&nbsp;·&nbsp;
+      <span class="dot r" style="margin:0 3px"></span><b>低</b>＝胜率或收益偏弱，谨慎&nbsp;·&nbsp;
       <span class="dot u" style="margin:0 3px"></span>＝样本不足。悬停灯点看依据。
     </div>
   </div>
@@ -1355,6 +1365,14 @@ def main():
                 del prof[t]
         except Exception:
             del prof[t]
+
+    # B 榜按「剔除一日闪现后的 5 日胜率」倒序展示（无画像/样本不足的排最后，
+    # 同胜率或无画像的沿用前面的近三日+代码序）。稳定排序保留同键原序。
+    def _b_wr(x):
+        e = bstats.get(x["ticker"])
+        return e.get("win_rate") if e else None
+    b_list.sort(key=lambda x: (_b_wr(x) is not None, _b_wr(x) if _b_wr(x) is not None else 0.0),
+                reverse=True)
 
     # 重绘率统计：把「昨日→今日」这一步的信号存活情况累积进 state（云端逐日累积，供 dashboard 展示）。
     # 用 prev_run < today 作闸：同一天重复跑（如手动 dispatch 多次）不会重复计入。
