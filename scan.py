@@ -530,15 +530,35 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
                 f'title="剔除一日闪现S后，{st["n"]} 个存活S里持有5日末收低于次日开盘的比例（反向胜率）">'
                 f'{r:.0f}%</td>')
 
+    def _reliability(st, side):
+        """综合可信度红绿灯（仅历史画像，不预示未来）：
+        消失率低 + 方向命中率过半 → 绿；消失率高或命中偏弱 → 红；其余黄。"""
+        if not st:
+            return ("u", "该股暂无足够历史信号，无法评估可信度")
+        dis = st.get("dis_rate")
+        good = st.get("win_rate") if side == "B" else st.get("down_rate")
+        gname = "5日胜率" if side == "B" else "5日下跌概率"
+        if dis is None or good is None:
+            return ("u", "样本不足，无法评估可信度")
+        if dis < 30 and good >= 55:
+            return ("g", f"可信度高：消失率 {dis:.0f}% 偏低、{gname} {good:.0f}% 过半（仅历史，不预示未来）")
+        if dis >= 50 or good < 45:
+            return ("r", f"可信度低：消失率 {dis:.0f}% 偏高或 {gname} {good:.0f}% 偏弱，谨慎（仅历史）")
+        return ("a", f"可信度中：消失率 {dis:.0f}%、{gname} {good:.0f}% 一般（仅历史）")
+
+    def _code_cell(code, st, side):
+        cls, tip = _reliability(st, side)
+        dot = f'<span class="dot {cls} reldot" title="{tip}"></span>'
+        link = (f'<a class="chart-link" data-sym="{code}">{code}</a>' if code in chart_data
+                else f'<a href="{tv_url(code)}" target="_blank" rel="noopener">{code}</a>')
+        return f'<td class="code">{dot}{link}</td>'
+
     def row_bs(item):
         code = item["ticker"]
         st = bstats.get(code)
-        has = code in chart_data
-        cell = (f'<a class="chart-link" data-sym="{code}">{code}</a>' if has
-                else f'<a href="{tv_url(code)}" target="_blank" rel="noopener">{code}</a>')
         return (
             f'<tr>'
-            f'<td class="code">{cell}</td>'
+            f'{_code_cell(code, st, "B")}'
             f'<td>{item["last_date"]}</td>'
             f'<td><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
             f'<td class="num">{item["price"]:.2f}</td>'
@@ -549,12 +569,9 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
     def row_s(item):
         code = item["ticker"]
         st = sstats.get(code)
-        has = code in chart_data
-        cell = (f'<a class="chart-link" data-sym="{code}">{code}</a>' if has
-                else f'<a href="{tv_url(code)}" target="_blank" rel="noopener">{code}</a>')
         return (
             f'<tr>'
-            f'<td class="code">{cell}</td>'
+            f'{_code_cell(code, st, "S")}'
             f'<td>{item["last_date"]}</td>'
             f'<td><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
             f'<td class="num">{item["price"]:.2f}</td>'
@@ -645,7 +662,18 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
   .stitle {{ display:flex; align-items:center; gap:8px; font-size:15px; font-weight:600; margin:0 0 8px; }}
   .dot {{ width:9px; height:9px; border-radius:50%; display:inline-block; }}
   .dot.g {{ background:var(--green); }} .dot.p {{ background:var(--pink); }} .dot.a {{ background:var(--amber); }}
+  .dot.r {{ background:#e5484d; }} .dot.u {{ background:#4d5866; }}
+  .reldot {{ margin-right:6px; vertical-align:middle; cursor:help; }}
   .cnt {{ color:var(--muted); font-size:12px; font-weight:400; }}
+  /* 首屏定位 + 风险声明 */
+  .intro {{ background:var(--panel); border:1px solid var(--line); border-left:3px solid #58a6ff;
+    border-radius:12px; padding:14px 16px; margin-top:14px; font-size:13px; line-height:1.7; }}
+  .intro h2 {{ font-size:14px; margin:0 0 6px; }}
+  .intro .is {{ color:#5fd98a; }} .intro .isnt {{ color:#f07fce; }}
+  .intro .legend {{ margin-top:8px; padding-top:8px; border-top:1px solid var(--line); color:var(--muted); }}
+  .intro .legend b {{ color:var(--text); }}
+  .intro .risk {{ margin-top:8px; padding:8px 10px; background:rgba(240,160,32,.10);
+    border:1px solid rgba(240,160,32,.35); border-radius:8px; color:#f0c070; font-size:12px; }}
   table {{ width:100%; border-collapse:collapse; font-size:13px; }}
   th, td {{ text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); }}
   th {{ color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.4px; }}
@@ -688,6 +716,24 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats):
     <h1>S1 买卖点扫描</h1>
     <div class="sub">数据截至 {meta['data_last']} · 生成于 {stamp} 美东 · 股票池 {meta['universe_n']} 只（成功 {meta['ok_n']}）</div>
   </header>
+
+  <div class="intro">
+    <h2>这是什么 · 怎么用</h2>
+    <span class="is">✔ 是</span>：一个「候选雷达 / 自选股过滤器」——每天把出现 S1 买卖点的股票列出来，帮你<b>缩小盯盘范围</b>，再自己看图、结合价格行为二次确认。<br>
+    <span class="isnt">✘ 不是</span>：预测涨跌的买卖信号，也<b>不构成任何投资建议</b>。别看到 B 就无脑买、看到 S 就做空。
+    <div class="risk">
+      ⚠ 重要：本指标<b>会重绘</b>——历史 K 线上的买卖点会随新数据变动甚至消失，实测约<b>一半信号最终会被抹掉</b>；
+      剥离重绘后，「当天新出的信号」次日入场基本<b>没有超越大盘的优势</b>，<b>S 做空为负期望（会亏钱）</b>。
+      请把它当筛选工具，务必自行判断、控制仓位与风险。数据可能延迟或缺失，不保证准确。
+    </div>
+    <div class="legend">
+      每行代码前的可信度灯（<b>仅代表该股历史表现，不预示未来</b>）：
+      <span class="dot g" style="margin:0 3px 0 6px"></span><b>高</b>＝消失率低且方向命中过半&nbsp;·&nbsp;
+      <span class="dot a" style="margin:0 3px"></span><b>中</b>＝一般&nbsp;·&nbsp;
+      <span class="dot r" style="margin:0 3px"></span><b>低</b>＝消失率高或命中偏弱，谨慎&nbsp;·&nbsp;
+      <span class="dot u" style="margin:0 3px"></span>＝样本不足。悬停灯点看依据。
+    </div>
+  </div>
 
   <section>
     <div class="stitle"><span class="dot g"></span> B 买点 · 当日/近三日 <span class="cnt">（{len(b_list)}）</span></div>
