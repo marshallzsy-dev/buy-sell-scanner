@@ -1307,6 +1307,20 @@ def main():
             "data_last": dates[-1],
         }
 
+    # 新鲜度保护：若绝大多数股票没到达「最新交易日」，说明这次抓到的是旧帧
+    # （yfinance 收盘后传播滞后 / 批量限流吃到缓存），跳过覆盖、保留上一份好数据，
+    # 避免用半新不旧的快照污染页面（也省下后面昂贵的画像计算）。
+    ld = [v["data_last"] for v in new_tickers_state.values() if v.get("data_last")]
+    if ld:
+        latest = max(ld)
+        fresh_frac = sum(1 for d in ld if d == latest) / len(ld)
+        if fresh_frac < 0.5:
+            from collections import Counter
+            print(f"⚠ 数据不新鲜：最新交易日 {latest} 仅 {fresh_frac*100:.1f}% 股票到达，"
+                  f"多数停留在 {Counter(ld).most_common(3)}。疑似 yfinance 传播滞后/限流，"
+                  f"跳过覆盖、保留上一份 state.json 与 dashboard.html。", flush=True)
+            sys.exit(2)
+
     # 最新的排最前，其次按代码
     b_list.sort(key=lambda x: (-x["sort"], x["ticker"]))
     s_list.sort(key=lambda x: (-x["sort"], x["ticker"]))
