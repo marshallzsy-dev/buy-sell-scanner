@@ -54,7 +54,7 @@ STATS_MIN_BARS = 60      # walk-forward 评估起点（与 analyze.py 口径一�
 STATS_WIN = 504          # 滚动重算窗口（约 2 年，与 HISTORY_PERIOD 一致）
 STATS_MAX_TICKERS = 150  # 单次最多「新算」多少只画像（防 CI 超时）；已缓存的不占额度
 PROFILE_TTL_DAYS = 10    # 画像缓存有效期（天）：超过则择机重算，画像是长期统计变化慢
-PROFILE_VER = 2          # 画像结构版本：变更字段口径时+1，旧缓存自动失效重算
+PROFILE_VER = 3          # 画像结构版本：变更字段口径时+1，旧缓存自动失效重算
 
 
 # ---------------------------------------------------------------------------
@@ -410,9 +410,12 @@ def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD, hold10=STATS_HOLD10,
             fwd10.append((closes[i + hold10] - eo) / eo * 100)   # 持有 10 交易日收益
     total = len(native)
     gone = sum(1 for _, d in native if d not in final_set)
+    # 幽灵：原生出现过但最终(重绘后)已不在图上的 B 日期——供缩略图标灰
+    ghosts = [d for _, d in native if d not in final_set]
     return {
         "fwd_avg": (sum(fwd) / len(fwd)) if fwd else None,
         "fwd_n": len(fwd),
+        "ghosts": ghosts,
         # 剔除一日闪现后，B 持有 hold 日末收为正的比例（%）
         "win_rate": (sum(1 for x in fwd if x > 0) / len(fwd) * 100) if fwd else None,
         "fwd10_avg": (sum(fwd10) / len(fwd10)) if fwd10 else None,
@@ -476,10 +479,12 @@ def s_symbol_stats(df, final_s_dates, hold=STATS_HOLD,
             down.append(1 if closes[i + hold] < eo else 0)   # 末日收盘 < 基准 → 下跌
     total = len(native)
     gone = sum(1 for _, d in native if d not in final_set)
+    ghosts = [d for _, d in native if d not in final_set]   # 消失的 S 日期，供缩图标灰
     return {
         "dd_avg": (sum(dd) / len(dd)) if dd else None,
         "down_rate": (sum(down) / len(down) * 100) if down else None,
         "n": len(dd),
+        "ghosts": ghosts,
         "dis_rate": (gone / total * 100) if total else None,
         "dis_gone": gone,
         "dis_total": total,
@@ -913,6 +918,8 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
       <div class="modal-title"><span id="m-sym"></span><span class="lg">
         <span class="b">▲ B 买点</span> · <span class="s">▼ S 卖点</span></span></div>
       <div class="modal-actions">
+        <label style="font-size:12px;color:#8b98a9;cursor:pointer;user-select:none;">
+          <input type="checkbox" id="g-toggle" style="accent-color:#58a6ff;vertical-align:middle;"> 历史消失点</label>
         <a id="m-tv" href="#" target="_blank" rel="noopener">在 TradingView 打开 ↗</a>
         <button class="modal-close" id="m-close" aria-label="关闭">×</button>
       </div>
@@ -925,7 +932,22 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
 <script>
 const CHART_DATA = {chart_json};
 const $ = (id) => document.getElementById(id);
-let _chart = null, _ro = null;
+let _chart = null, _ro = null, _series = null, _data = null, _mprim = null;
+let _showGhosts = (localStorage.getItem('s1_show_ghosts') || '1') !== '0';
+
+// 单个 marker → lightweight-charts 样式；ghost（历史消失点）用灰色、无字母。
+function _mObj(m) {{
+  const g = !!m.ghost;
+  return m.side === 'B'
+    ? {{ time: m.time, position: 'belowBar', color: g ? '#5b6470' : '#2fb35a', shape: 'arrowUp', text: g ? '' : 'B' }}
+    : {{ time: m.time, position: 'aboveBar', color: g ? '#5b6470' : '#d63c9c', shape: 'arrowDown', text: g ? '' : 'S' }};
+}}
+function renderMarkers() {{
+  if (!_series || !_data) return;
+  const ms = _data.markers.filter(m => _showGhosts || !m.ghost).map(_mObj);
+  if (_mprim) _mprim.setMarkers(ms);
+  else _mprim = window.LightweightCharts.createSeriesMarkers(_series, ms);
+}}
 
 function openChart(sym) {{
   const d = CHART_DATA[sym];
@@ -951,11 +973,8 @@ function openChart(sym) {{
     wickUpColor: '#2fb35a', wickDownColor: '#d63c9c',
   }});
   series.setData(d.bars);
-
-  const markers = d.markers.map(m => m.side === 'B'
-    ? {{ time: m.time, position: 'belowBar', color: '#2fb35a', shape: 'arrowUp', text: 'B' }}
-    : {{ time: m.time, position: 'aboveBar', color: '#d63c9c', shape: 'arrowDown', text: 'S' }});
-  LWC.createSeriesMarkers(series, markers);
+  _series = series; _data = d; _mprim = null;   // 每次新图重建 markers
+  renderMarkers();
   _chart.timeScale().fitContent();
 
   _ro = new ResizeObserver(() => {{
@@ -968,6 +987,7 @@ function closeChart() {{
   $('modal').classList.remove('open');
   if (_ro) {{ _ro.disconnect(); _ro = null; }}
   if (_chart) {{ _chart.remove(); _chart = null; }}
+  _series = null; _data = null; _mprim = null;
 }}
 
 window.openChart = openChart;
@@ -979,6 +999,16 @@ document.addEventListener('click', (e) => {{
 $('m-close').addEventListener('click', closeChart);
 $('modal').addEventListener('click', (e) => {{ if (e.target === $('modal')) closeChart(); }});
 document.addEventListener('keydown', (e) => {{ if (e.key === 'Escape') closeChart(); }});
+(function() {{
+  const gt = $('g-toggle');
+  if (!gt) return;
+  gt.checked = _showGhosts;
+  gt.addEventListener('change', () => {{
+    _showGhosts = gt.checked;
+    localStorage.setItem('s1_show_ghosts', _showGhosts ? '1' : '0');
+    renderMarkers();
+  }});
+}})();
 </script>
 
 <script>
@@ -1429,6 +1459,21 @@ def main():
                 del prof[t]
         except Exception:
             del prof[t]
+
+    # 历史消失点（幽灵）：把画像 walk 里「原生出现过但已被重绘抹掉」的 B/S 日期，
+    # 落在缩略图窗口内、且当前已非真信号的，追加成灰色 marker（ghost=1）。
+    for t, cd in chart_data.items():
+        wtimes = {b["time"] for b in cd["bars"]}
+        real = {(m["time"], m["side"]) for m in cd["markers"]}
+        gh = []
+        for side, stt in (("B", bstats.get(t)), ("S", sstats.get(t))):
+            if not stt:
+                continue
+            for d in stt.get("ghosts", []):
+                if d in wtimes and (d, side) not in real:
+                    gh.append({"time": d, "side": side, "ghost": 1})
+        if gh:
+            cd["markers"] = sorted(cd["markers"] + gh, key=lambda m: m["time"])
 
     # B 榜排序：先按新近度（今日出现的排最前），同一最近日期内再按「剔除一日闪现后的
     # 5 日胜率」倒序；无画像/样本不足的排该日期组末尾。稳定排序保留同键的代码序。
