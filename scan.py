@@ -49,10 +49,12 @@ CHART_BARS = 250         # 弹层图表保留的最近 K 线根数（约 1 年�
 
 # 每只上榜股票的 B 信号历史画像（前向收益 / 回撤 / 消失率）
 STATS_HOLD = 5           # 前向持有交易日数（“B 后 5 日”）
+STATS_HOLD10 = 10        # 第二档前向持有天数（“B 后 10 日”均收益）
 STATS_MIN_BARS = 60      # walk-forward 评估起点（与 analyze.py 口径一致）
 STATS_WIN = 504          # 滚动重算窗口（约 2 年，与 HISTORY_PERIOD 一致）
 STATS_MAX_TICKERS = 150  # 单次最多「新算」多少只画像（防 CI 超时）；已缓存的不占额度
 PROFILE_TTL_DAYS = 10    # 画像缓存有效期（天）：超过则择机重算，画像是长期统计变化慢
+PROFILE_VER = 2          # 画像结构版本：变更字段口径时+1，旧缓存自动失效重算
 
 
 # ---------------------------------------------------------------------------
@@ -348,12 +350,13 @@ def build_chart_data(df, cur):
     return {"bars": bars, "markers": markers}
 
 
-def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
+def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD, hold10=STATS_HOLD10,
                    min_bars=STATS_MIN_BARS, win=STATS_WIN):
     """单只股票的 B 信号历史画像，walk-forward 逐根重算 realtime B 信号后计算：
-      - fwd_avg : realtime B「次日开盘入场→持有 hold 交易日→末日收盘平仓」的平均收益率(%)
-      - dd_avg  : 上述持有期内「每日相对入场价回撤(仅计跌破入场价部分)」的平均值(%，≤0)
-      - dis_rate: realtime 原生出现的 B 信号里，最终在定型(重绘后)信号中消失的比例(%)
+      - fwd_avg  : realtime B「次日开盘入场→持有 hold 交易日→末日收盘平仓」的平均收益率(%)
+      - fwd10_avg: 同上但持有 hold10(=10) 交易日的平均收益率(%)
+      - dd_avg   : 上述持有期内「每日相对入场价回撤(仅计跌破入场价部分)」的平均值(%，≤0)
+      - dis_rate : realtime 原生出现的 B 信号里，最终在定型(重绘后)信号中消失的比例(%)
     收益/回撤仅统计「熬过至少一天」的 B（bar i 出现、次日 i+1 重算仍在图上）；
     一日闪现(次日即消失)的 B 实盘抓不住，从收益/回撤剔除（但仍计入 dis_rate 消失率）。
     realtime 判定 / 入场出场口径与 analyze.py 的 forward_all 完全一致（剥掉重绘 lookahead）。
@@ -389,18 +392,22 @@ def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
 
     # 收益/回撤只统计「熬过至少一天」的 B：bar i 出现、bar i+1 重算仍在图上。
     # 一日闪现（次日即消失）的 B 实盘根本抓不住，剔除以免拉低画像。
-    fwd, dd, flash = [], [], 0
+    fwd, fwd10, dd, flash = [], [], [], 0
     for i, d in native:
         if not (i + 1 < n and step_b[i + 1] is not None and d in step_b[i + 1]):
             flash += 1
             continue                                  # 一日闪现，剔除出收益/回撤
         eo = opens[i + 1] if i + 1 < n else 0.0
-        if i + hold < n and eo:
+        if not eo:
+            continue
+        if i + hold < n:
             fwd.append((closes[i + hold] - eo) / eo * 100)
             # 持有 hold 日内「每日相对入场价的回撤」（仅计跌破入场价部分，≤0），再取均值——
             # 反映典型回撤水平，而非最坏单点。
             daily_dd = [min(0.0, (lw - eo) / eo) for lw in lows[i + 1:i + hold + 1]]
             dd.append(sum(daily_dd) / len(daily_dd) * 100)
+        if i + hold10 < n:
+            fwd10.append((closes[i + hold10] - eo) / eo * 100)   # 持有 10 交易日收益
     total = len(native)
     gone = sum(1 for _, d in native if d not in final_set)
     return {
@@ -408,6 +415,8 @@ def b_symbol_stats(df, final_b_dates, hold=STATS_HOLD,
         "fwd_n": len(fwd),
         # 剔除一日闪现后，B 持有 hold 日末收为正的比例（%）
         "win_rate": (sum(1 for x in fwd if x > 0) / len(fwd) * 100) if fwd else None,
+        "fwd10_avg": (sum(fwd10) / len(fwd10)) if fwd10 else None,
+        "fwd10_n": len(fwd10),
         "dd_avg": (sum(dd) / len(dd)) if dd else None,
         "dis_rate": (gone / total * 100) if total else None,
         "dis_gone": gone,
@@ -492,6 +501,14 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
         color = "#5fd98a" if v > 0 else ("#f07fce" if v < 0 else "var(--muted)")
         return (f'<td class="num"{_mt("B后5日均收益")} style="color:{color}" '
                 f'title="{st["fwd_n"]} 个存活B样本（已剔除 {st.get("flash", 0)} 个一日闪现）">{v:+.1f}%</td>')
+
+    def _fwd10_cell(st):
+        if not st or st.get("fwd10_avg") is None:
+            return f'<td class="num"{_mt("B后10日均收益")} style="color:var(--muted)">—</td>'
+        v = st["fwd10_avg"]
+        color = "#5fd98a" if v > 0 else ("#f07fce" if v < 0 else "var(--muted)")
+        return (f'<td class="num"{_mt("B后10日均收益")} style="color:{color}" '
+                f'title="剔除一日闪现B后，{st.get("fwd10_n", 0)} 个存活B：次日开盘入场、持有10交易日、末日收盘的平均收益">{v:+.1f}%</td>')
 
     def _win_cell(st):
         if not st or st.get("win_rate") is None:
@@ -578,7 +595,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
             f'<td data-label="最近B日期">{item["last_date"]}</td>'
             f'<td data-label="时点"><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
             f'<td class="num" data-label="现价">{item["price"]:.2f}</td>'
-            f'{_fwd_cell(st)}{_win_cell(st)}{_dd_cell(st)}{_dis_cell(st, "B")}'
+            f'{_fwd_cell(st)}{_fwd10_cell(st)}{_win_cell(st)}{_dd_cell(st)}{_dis_cell(st, "B")}'
             f'</tr>'
         )
 
@@ -611,7 +628,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
             f'</tr>'
         )
 
-    b_rows = "\n".join(row_bs(x) for x in b_list) or '<tr><td colspan="8" class="empty">近三日无 B 买点</td></tr>'
+    b_rows = "\n".join(row_bs(x) for x in b_list) or '<tr><td colspan="9" class="empty">近三日无 B 买点</td></tr>'
     s_rows = "\n".join(row_s(x) for x in s_list) or '<tr><td colspan="7" class="empty">近三日无 S 卖点</td></tr>'
     warn_rows = "\n".join(row_warn(w) for w in warnings) or \
         '<tr><td colspan="4" class="empty">暂无消失记录（需累积历史快照，运行几天后逐步显现）</td></tr>'
@@ -829,6 +846,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
     <table class="dtable">
       <thead><tr><th>代码</th><th>最近B日期</th><th>时点</th><th>现价</th>
         <th class="num" title="历史实时B信号：次日开盘入场、持有5交易日、末日收盘平仓的平均收益">B后5日均收益</th>
+        <th class="num" title="剔除一日闪现B后：次日开盘入场、持有10交易日、末日收盘的平均收益">B后10日均收益</th>
         <th class="num" title="剔除一日闪现B后，持有5交易日末收为正的比例">B后5日胜率</th>
         <th class="num" title="历史实时B信号：持有5日内每日相对入场价回撤的平均值（仅计跌破入场价的部分）">B后5日均回撤</th>
         <th class="num" title="历史实时B信号中，最终被重绘抹掉（消失）的比例">B消失率</th></tr></thead>
@@ -874,8 +892,8 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
 
   <footer>
     · 点击代码弹出该股 K 线图，B/S 买卖点已标在图上（可缩放、拖动）；无图表数据的代码则跳 TradingView。<br>
-    · <b>B后5日均收益 / B后5日胜率 / B后5日均回撤 / B消失率</b>：均为该股<b>历史</b>画像（非本次信号预测），基于 walk-forward 逐根重算的
-      <b>实时(realtime)B 信号</b>（剥掉重绘 lookahead）。收益=次日开盘入场、持有 5 交易日、末日收盘平仓的平均值；
+    · <b>B后5日均收益 / B后10日均收益 / B后5日胜率 / B后5日均回撤 / B消失率</b>：均为该股<b>历史</b>画像（非本次信号预测），基于 walk-forward 逐根重算的
+      <b>实时(realtime)B 信号</b>（剥掉重绘 lookahead）。收益=次日开盘入场、持有 5（或 10）交易日、末日收盘平仓的平均值；
       均回撤=持有 5 日内每日相对入场价回撤（仅计跌破入场价的部分）的平均值；胜率=持有 5 日末收为正的比例；
       <b>收益/胜率/回撤均已剔除「次日即消失」的一日闪现 B</b>（实盘抓不住）；
       消失率=实时出现过的 B 里最终被重绘抹掉的比例（越低越可信，仍含一日闪现）。<br>
@@ -1349,6 +1367,9 @@ def main():
     s_tickers = _dedup(x["ticker"] for x in s_list)
 
     prof = state.get("profiles", {})    # {t: {"B":stat|None, "S":stat|None, "asof":"YYYY-MM-DD"}}
+    if state.get("profiles_ver") != PROFILE_VER:   # 画像口径变更→旧缓存作废，逐日重算
+        print(f"画像结构版本 {state.get('profiles_ver')} → {PROFILE_VER}，清空旧缓存重算。", flush=True)
+        prof = {}
 
     def _fresh(t):
         e = prof.get(t)
@@ -1409,12 +1430,13 @@ def main():
         except Exception:
             del prof[t]
 
-    # B 榜按「剔除一日闪现后的 5 日胜率」倒序展示（无画像/样本不足的排最后，
-    # 同胜率或无画像的沿用前面的近三日+代码序）。稳定排序保留同键原序。
+    # B 榜排序：先按新近度（今日出现的排最前），同一最近日期内再按「剔除一日闪现后的
+    # 5 日胜率」倒序；无画像/样本不足的排该日期组末尾。稳定排序保留同键的代码序。
     def _b_wr(x):
         e = bstats.get(x["ticker"])
         return e.get("win_rate") if e else None
-    b_list.sort(key=lambda x: (_b_wr(x) is not None, _b_wr(x) if _b_wr(x) is not None else 0.0),
+    b_list.sort(key=lambda x: (x["sort"], _b_wr(x) is not None,
+                               _b_wr(x) if _b_wr(x) is not None else 0.0),
                 reverse=True)
 
     # 重绘率统计：把「昨日→今日」这一步的信号存活情况累积进 state（云端逐日累积，供 dashboard 展示）。
@@ -1450,6 +1472,7 @@ def main():
     state["warnings"] = warnings
     state["repaint_stats"] = rstats
     state["profiles"] = prof
+    state["profiles_ver"] = PROFILE_VER
     save_state(state)
 
     # 邮件正文 + 主题（供 CI 发信；本地跑也会生成，无害）
