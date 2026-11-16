@@ -4,9 +4,9 @@ scan.py
 每日扫描器：
   1. 读取 universe.txt 股票池
   2. yfinance 拉取日线数据
-  3. 用 s1_signals.compute_signals 计算 B / S 买卖点（忠实复刻 S1 指标，会重绘）
+  3. 用 s1_signals.compute_signals 计算 B / S 买卖点 + IB/E 复盘标签（忠实复刻 S1 指标，会重绘）
   4. 与上一次运行的快照对比，检测「近期消失的 B/S 买卖点」及其消失节点
-  5. 生成 dashboard.html（B 名单 / S 名单 / Warning 消失区，代码可点击跳 TradingView）
+  5. 生成 dashboard.html（B / S 名单 + IB·E 痕迹区 / Warning 消失区，代码可点击弹 K 线图）
 
 状态文件 state.json 会自动创建并逐日累积——Warning 区需要有历史快照才会有内容，
 所以第一天运行不会有「消失」记录，之后每天逐步显现。
@@ -317,7 +317,9 @@ def days_ago_label(bar_date, ref_dates):
 
 def build_chart_data(df, cur):
     """把一只股票的信号结果压成弹层图表所需的数据：
-       最近 CHART_BARS 根 K 线 OHLC + 落在该窗口内的 B/S 标记。
+       最近 CHART_BARS 根 K 线 OHLC + 落在该窗口内的 B/S/IB/E 标记。
+       IB/E 键用 .get 防御式读取——三个调用点里只有主循环保证传了
+       include_ibe=True 的结果。
        返回 {'bars': [...], 'markers': [...]}。"""
     dates = cur["dates"]
     n = len(dates)
@@ -346,6 +348,12 @@ def build_chart_data(df, cur):
     for d in cur["s_dates"]:
         if d in window:
             markers.append({"time": d, "side": "S"})
+    for d in cur.get("ib_dates", []):
+        if d in window:
+            markers.append({"time": d, "side": "IB"})
+    for d in cur.get("e_dates", []):
+        if d in window:
+            markers.append({"time": d, "side": "E"})
     markers.sort(key=lambda m: m["time"])
     return {"bars": bars, "markers": markers}
 
@@ -492,7 +500,7 @@ def s_symbol_stats(df, final_s_dates, hold=STATS_HOLD,
     }
 
 
-def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum=None):
+def render_html(b_list, s_list, ibe_list, warnings, meta, chart_data, bstats, sstats, usum=None):
     et = meta["run_et"]
     stamp = et.strftime("%Y-%m-%d %H:%M")
 
@@ -617,6 +625,24 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
             f'</tr>'
         )
 
+    def row_ibe(item):
+        # IB/E 是复盘标签、无历史画像 → 不放可信度灯，代码格只有链接 + 收藏星
+        code = item["ticker"]
+        link = (f'<a class="chart-link" data-sym="{code}">{code}</a>' if code in chart_data
+                else f'<a href="{tv_url(code)}" target="_blank" rel="noopener">{code}</a>')
+        star = f'<span class="star" data-sym="{code}" title="加入/移出自选">☆</span>'
+        tags = ('<span class="tag ib">IB</span>' if "IB" in item["type"] else "") \
+             + (' <span class="tag e">E</span>' if "E" in item["type"] else "")
+        return (
+            f'<tr data-tbl="ibe" data-sym="{code}">'
+            f'<td class="code">{link}{star}</td>'
+            f'<td data-label="类型">{tags}</td>'
+            f'<td data-label="日期">{item["last_date"]}</td>'
+            f'<td data-label="时点"><span class="pill {item["recency_cls"]}">{item["recency"]}</span></td>'
+            f'<td class="num" data-label="现价">{item["price"]:.2f}</td>'
+            f'</tr>'
+        )
+
     def row_warn(w):
         code = w["ticker"]
         badge = "B" if w["side"] == "B" else "S"
@@ -635,6 +661,8 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
 
     b_rows = "\n".join(row_bs(x) for x in b_list) or '<tr><td colspan="9" class="empty">近三日无 B 买点</td></tr>'
     s_rows = "\n".join(row_s(x) for x in s_list) or '<tr><td colspan="7" class="empty">近三日无 S 卖点</td></tr>'
+    # 空态行不带 data-tbl，避免被「只看自选/查看更多」的选择器误伤
+    ibe_rows = "\n".join(row_ibe(x) for x in ibe_list) or '<tr><td colspan="5" class="empty">近三日无 IB / E 痕迹</td></tr>'
     warn_rows = "\n".join(row_warn(w) for w in warnings) or \
         '<tr><td colspan="4" class="empty">暂无消失记录（需累积历史快照，运行几天后逐步显现）</td></tr>'
 
@@ -761,6 +789,8 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
   .tag {{ font-size:11px; padding:1px 7px; border-radius:6px; font-weight:600; }}
   .tag.b {{ background:rgba(47,179,90,.18); color:#5fd98a; }}
   .tag.s {{ background:rgba(214,60,156,.18); color:#f07fce; }}
+  .tag.ib {{ background:rgba(35,110,220,.18); color:#6f9ff0; }}
+  .tag.e {{ background:rgba(235,135,30,.15); color:#f0a85c; }}
   .warn-sec {{ border-color:rgba(240,160,32,.4); }}
   .empty {{ color:var(--muted); text-align:center; padding:16px; }}
   footer {{ color:var(--muted); font-size:11px; margin-top:22px; line-height:1.6; }}
@@ -776,6 +806,7 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
   .modal-title {{ font-size:16px; font-weight:600; letter-spacing:.5px; }}
   .modal-title .lg {{ margin-left:8px; font-size:11px; font-weight:400; }}
   .modal-title .lg .b {{ color:#5fd98a; }} .modal-title .lg .s {{ color:#f07fce; }}
+  .modal-title .lg .ib {{ color:#6f9ff0; }} .modal-title .lg .e {{ color:#f0a85c; }}
   .modal-actions {{ display:flex; align-items:center; gap:12px; }}
   .modal-actions a {{ color:#58a6ff; font-size:12px; text-decoration:none; }}
   .modal-close {{ cursor:pointer; color:var(--muted); font-size:22px; line-height:1;
@@ -821,6 +852,10 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
       ⚠ 重要：本指标<b>会重绘</b>——历史 K 线上的买卖点会随新数据变动甚至消失，实测约<b>一半信号最终会被抹掉</b>；
       剥离重绘后，「当天新出的信号」次日入场基本<b>没有超越大盘的优势</b>，<b>S 做空为负期望（会亏钱）</b>。
       请把它当筛选工具，务必自行判断、控制仓位与风险。数据可能延迟或缺失，不保证准确。
+    </div>
+    <div style="margin-top:8px;font-size:12px;color:var(--muted);line-height:1.7;">
+      <b style="color:#6f9ff0">IB 机构吸筹</b> / <b style="color:#f0a85c">E 量能事件</b>：移植自完整版指标的<b>复盘标签</b>——规则需<b>次日 K 线确认</b>，
+      历史标签随新数据出现/消失属正常现象；非实时买卖信号、不参与消失告警，仅供研究参考。
     </div>
     <div class="legend">
       每行代码前的可信度灯（<b>仅看剔除一日闪现后的命中率与收益/回撤，不含消失率；仅代表历史、不预示未来</b>）：
@@ -875,6 +910,20 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
     </table>
   </section>
 
+  <section>
+    <div class="stitle"><span class="dot" style="background:#236edc"></span> IB / E 痕迹 · 当日/近三日 <span class="cnt">（{len(ibe_list)}）</span>
+      <span style="color:var(--muted);font-size:11px;font-weight:400">复盘标签 · 次日确认 · 非实时信号</span>
+      <span class="wl-spacer"></span>
+      <label class="filt"><input type="checkbox" class="wl-only" data-tbl="ibe"> 只看自选</label></div>
+    <table class="dtable">
+      <thead><tr><th>代码</th><th>类型</th><th>日期</th><th>时点</th><th class="num">现价</th></tr></thead>
+      <tbody>{ibe_rows}</tbody>
+    </table>
+    <div style="text-align:center;margin-top:6px;">
+      <button id="ibe-more" class="more-btn" style="display:none">查看更多</button>
+    </div>
+  </section>
+
   <section class="warn-sec">
     <div class="stitle"><span class="dot a"></span> ⚠ Warning · 近期消失的买卖点 <span class="cnt">（{len(warnings)}）</span></div>
     <table>
@@ -896,7 +945,9 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
   </section>
 
   <footer>
-    · 点击代码弹出该股 K 线图，B/S 买卖点已标在图上（可缩放、拖动）；无图表数据的代码则跳 TradingView。<br>
+    · 点击代码弹出该股 K 线图，B/S 买卖点与 IB/E 痕迹已标在图上（可缩放、拖动）；无图表数据的代码则跳 TradingView。<br>
+    · <b>IB（机构吸筹）= 量价形态像大资金买入痕迹的K线</b>（放量大涨/悄悄吸筹/吸收等模式），<b>E（量能事件）= 成交额/换手统计异常的K线</b>（爆量/跳空/TD衰竭高潮等）。
+      两者均移植自完整版指标、<b>需次日K线确认</b>，属复盘标签：历史标签会随新数据出现/移动/消失，非实时信号，不参与消失告警。<br>
     · <b>B后5日均收益 / B后10日均收益 / B后5日胜率 / B后5日均回撤 / B消失率</b>：均为该股<b>历史</b>画像（非本次信号预测），基于 walk-forward 逐根重算的
       <b>实时(realtime)B 信号</b>（剥掉重绘 lookahead）。收益=次日开盘入场、持有 5（或 10）交易日、末日收盘平仓的平均值；
       均回撤=持有 5 日内每日相对入场价回撤（仅计跌破入场价的部分）的平均值；胜率=持有 5 日末收为正的比例；
@@ -916,7 +967,8 @@ def render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum
   <div class="modal-box">
     <div class="modal-head">
       <div class="modal-title"><span id="m-sym"></span><span class="lg">
-        <span class="b">▲ B 买点</span> · <span class="s">▼ S 卖点</span></span></div>
+        <span class="b">▲ B 买点</span> · <span class="s">▼ S 卖点</span> ·
+        <span class="ib">● IB 机构吸筹</span> · <span class="e">● E 量能事件</span></span></div>
       <div class="modal-actions">
         <label style="font-size:12px;color:#8b98a9;cursor:pointer;user-select:none;">
           <input type="checkbox" id="g-toggle" style="accent-color:#58a6ff;vertical-align:middle;"> 历史消失点</label>
@@ -936,7 +988,10 @@ let _chart = null, _ro = null, _series = null, _data = null, _mprim = null;
 let _showGhosts = (localStorage.getItem('s1_show_ghosts') || '1') !== '0';
 
 // 单个 marker → lightweight-charts 样式；ghost（历史消失点）用灰色、无字母。
+// IB/E 用圆点（与 B/S 箭头区分），颜色对应 Pine 标签 rgb(35,110,220)/rgb(235,135,30)；IB/E 无 ghost。
 function _mObj(m) {{
+  if (m.side === 'IB') return {{ time: m.time, position: 'belowBar', color: '#236edc', shape: 'circle', text: 'IB' }};
+  if (m.side === 'E') return {{ time: m.time, position: 'aboveBar', color: '#eb871e', shape: 'circle', text: 'E' }};
   const g = !!m.ghost;
   return m.side === 'B'
     ? {{ time: m.time, position: 'belowBar', color: g ? '#5b6470' : '#2fb35a', shape: 'arrowUp', text: g ? '' : 'B' }}
@@ -1059,13 +1114,18 @@ window.__UNIVERSE__ = {uni_json};
   function favSet() {{ var s = {{}}; load().forEach(function(t) {{ s[t] = 1; }}); return s; }}
   var bExpanded = false;
   var B_LIMIT = 50;
+  var ibeExpanded = false;
+  var IBE_LIMIT = 50;
   function applyFilter() {{
-    // 只处理 S 表；B 表由 applyBView 统一管（50 条上限 + 只看自选）
-    var cb = document.querySelector('.wl-only[data-tbl="s"]');
-    if (!cb) return;
-    var set = favSet();
-    document.querySelectorAll('tr[data-tbl="s"]').forEach(function(tr) {{
-      if (tr.dataset.sym) tr.style.display = (!cb.checked || set[tr.dataset.sym]) ? '' : 'none';
+    // 只处理 S / IB·E 表；B 表由 applyBView 统一管（50 条上限 + 只看自选）。
+    // 逐表各自读自己的勾选框，互不干扰、重复调用幂等。
+    ['s', 'ibe'].forEach(function(tbl) {{
+      var cb = document.querySelector('.wl-only[data-tbl="' + tbl + '"]');
+      if (!cb) return;
+      var set = favSet();
+      document.querySelectorAll('tr[data-tbl="' + tbl + '"]').forEach(function(tr) {{
+        if (tr.dataset.sym) tr.style.display = (!cb.checked || set[tr.dataset.sym]) ? '' : 'none';
+      }});
     }});
   }}
   function applyBView() {{
@@ -1091,6 +1151,30 @@ window.__UNIVERSE__ = {uni_json};
       }}
     }}
   }}
+  // IB·E 表与 B 表同款：50 条上限 + 只看自选（结构复制品，改动隔离）
+  function applyIbeView() {{
+    var cb = document.querySelector('.wl-only[data-tbl="ibe"]');
+    var favOnly = cb && cb.checked;
+    var set = favSet();
+    var rows = document.querySelectorAll('tr[data-tbl="ibe"]');
+    var shown = 0;
+    rows.forEach(function(tr) {{
+      var t = tr.dataset.sym; if (!t) return;
+      var visible;
+      if (favOnly) {{ visible = !!set[t]; }}
+      else {{ visible = ibeExpanded || shown < IBE_LIMIT; shown++; }}
+      tr.style.display = visible ? '' : 'none';
+    }});
+    var btn = document.getElementById('ibe-more');
+    if (btn) {{
+      var total = rows.length;
+      if (favOnly || total <= IBE_LIMIT) {{ btn.style.display = 'none'; }}
+      else {{
+        btn.style.display = '';
+        btn.textContent = ibeExpanded ? '收起' : ('查看更多（还有 ' + (total - IBE_LIMIT) + ' 只）');
+      }}
+    }}
+  }}
   function refresh() {{
     var l = load();
     var cnt = document.getElementById('wl-cnt'); if (cnt) cnt.textContent = '（' + l.length + '）';
@@ -1103,6 +1187,7 @@ window.__UNIVERSE__ = {uni_json};
     syncStars();
     applyFilter();
     applyBView();
+    applyIbeView();
   }}
 
   var dl = document.getElementById('wl-list');
@@ -1114,10 +1199,12 @@ window.__UNIVERSE__ = {uni_json};
   var inp = document.getElementById('wl-search');
   if (inp) inp.addEventListener('keydown', function(e) {{ if (e.key === 'Enter') {{ add(inp.value); inp.value = ''; }} }});
   document.querySelectorAll('.wl-only').forEach(function(cb) {{
-    cb.addEventListener('change', function() {{ applyFilter(); applyBView(); }});
+    cb.addEventListener('change', function() {{ applyFilter(); applyBView(); applyIbeView(); }});
   }});
   var moreBtn = document.getElementById('b-more');
   if (moreBtn) moreBtn.addEventListener('click', function() {{ bExpanded = !bExpanded; applyBView(); }});
+  var ibeBtn = document.getElementById('ibe-more');
+  if (ibeBtn) ibeBtn.addEventListener('click', function() {{ ibeExpanded = !ibeExpanded; applyIbeView(); }});
   refresh();
 }})();
 </script>
@@ -1286,6 +1373,7 @@ def main():
     new_tickers_state = {}
     b_list = []
     s_list = []
+    ibe_list = []
     new_warnings = []
     data_last = ""
     chart_data = {}   # {ticker: {'bars':[...], 'markers':[...]}}
@@ -1294,7 +1382,9 @@ def main():
 
     for t, df in data.items():
         try:
-            cur = compute_signals(df)
+            # include_ibe=True：主循环每票只算一次，顺手把 IB/E 标签也算出来；
+            # 画像 walk-forward 里那 ~440 次/票 的滚动重算保持默认（不重算 IB/E）。
+            cur = compute_signals(df, include_ibe=True)
         except Exception as e:
             print(f"  {t} 计算失败: {e}", flush=True)
             continue
@@ -1310,6 +1400,9 @@ def main():
         # 近三日 B / S 名单
         recent_b = [d for d in cur["b_dates"] if d in recent]
         recent_s = [d for d in cur["s_dates"] if d in recent]
+        # 近三日 IB / E 痕迹（复盘标签，仅上榜展示，不进消失告警/快照）
+        recent_ib = [d for d in cur.get("ib_dates", []) if d in recent]
+        recent_e = [d for d in cur.get("e_dates", []) if d in recent]
         if recent_b:
             last_d = max(recent_b)
             b_list.append({
@@ -1326,8 +1419,18 @@ def main():
                 "recency_cls": "today" if last_d == dates[-1] else "recent",
                 "sort": dates.index(last_d),
             })
-        # 上榜股票（B 或 S）额外保存画图数据
-        if recent_b or recent_s:
+        if recent_ib or recent_e:
+            last_d = max(recent_ib + recent_e)
+            ibe_list.append({
+                "ticker": t, "last_date": last_d, "price": price,
+                "recency": days_ago_label(last_d, dates),
+                "recency_cls": "today" if last_d == dates[-1] else "recent",
+                "sort": dates.index(last_d),
+                "type": "IB+E" if (recent_ib and recent_e)
+                        else ("IB" if recent_ib else "E"),
+            })
+        # 上榜股票（B / S / IB / E）额外保存画图数据
+        if recent_b or recent_s or recent_ib or recent_e:
             chart_data[t] = build_chart_data(df, cur)
 
         # 消失检测
@@ -1372,6 +1475,7 @@ def main():
     # 最新的排最前，其次按代码
     b_list.sort(key=lambda x: (-x["sort"], x["ticker"]))
     s_list.sort(key=lambda x: (-x["sort"], x["ticker"]))
+    ibe_list.sort(key=lambda x: (-x["sort"], x["ticker"]))
 
     warnings = merge_warnings(state.get("warnings", []), new_warnings, today)
     # 展示排序：检测日新的在前，其次消失节点新的在前
@@ -1507,7 +1611,7 @@ def main():
         "lwc_lib": load_lwc_lib(),
         "repaint_stats": rstats,
     }
-    html = render_html(b_list, s_list, warnings, meta, chart_data, bstats, sstats, usum)
+    html = render_html(b_list, s_list, ibe_list, warnings, meta, chart_data, bstats, sstats, usum)
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -1527,7 +1631,7 @@ def main():
     with open(EMAIL_SUBJECT, "w", encoding="utf-8") as f:
         f.write(subject)
 
-    print(f"完成：B {len(b_list)} 只 / S {len(s_list)} 只 / 消失告警 {len(warnings)} 条", flush=True)
+    print(f"完成：B {len(b_list)} 只 / S {len(s_list)} 只 / IB·E {len(ibe_list)} 只 / 消失告警 {len(warnings)} 条", flush=True)
     print(f"已生成 {OUTPUT_HTML}", flush=True)
 
 
